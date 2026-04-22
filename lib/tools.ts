@@ -37,21 +37,60 @@ function sessionId(): string {
 }
 
 // ----- Cart-add evidence gate -----------------------------------------------
-// Words that describe a cuisine / vague craving, not a specific item. If the
-// model quotes any of these as user_selection_evidence for a specific item,
-// we reject — the user has to actually pick something. This list is narrow on
-// purpose: it only catches the single-word generic case. Real item names like
-// "pepperoni pizza", "margherita", "thai green curry" pass through because
-// they're multi-word OR name a specific dish.
+// Words that describe a cuisine / vague craving, not a specific item. Kept as
+// a secondary filter inside the evidence check — belt-and-suspenders alongside
+// the primary "selection mode" gate (checkbox tap OR reorder phrase).
 const GENERIC_PHRASES = new Set<string>([
   "food", "anything", "something", "whatever", "surprise", "surprise me",
   "hungry", "order", "order something", "order me something", "dinner",
-  "lunch", "breakfast", "brunch", "a meal", "meal", "the usual", "usual",
+  "lunch", "breakfast", "brunch", "a meal", "meal",
   "pizza", "pasta", "burger", "burgers", "sushi", "curry", "tacos",
   "thai", "indian", "chinese", "mexican", "italian", "japanese", "korean",
   "vietnamese", "mediterranean", "american", "dessert", "drinks", "a drink",
   "coffee", "tea", "yes", "go", "ok", "sure", "sounds good", "confirm",
 ]);
+
+// ----- Explicit-selection gate ---------------------------------------------
+// Product rule: we NEVER build a cart from the user's free-text mention of an
+// item. The user must either (a) tap a menu checkbox — the frontend converts
+// that into an "Add <Item name> from <Restaurant>" message — or (b) invoke
+// a reorder phrase ("my usual", "same as last time"). Free-text names like
+// "order me a large pepperoni pizza" are deliberately excluded: in that case
+// the agent must show the menu and wait for a tap.
+//
+// These two predicates classify user_intent_message into one of the two
+// allowed modes. Everything else → reject.
+function isCheckboxTapMessage(msgLower: string): boolean {
+  // Frontend emits exactly: "Add <Item Name> from <Restaurant Name>"
+  // Tolerate leading whitespace and optional quantity suffixes; require the
+  // "add " prefix and a " from " infix so we don't false-positive on a user
+  // typing "add pepperoni" in chat.
+  const trimmed = msgLower.trim();
+  if (!trimmed.startsWith("add ")) return false;
+  if (!trimmed.includes(" from ")) return false;
+  // Reject the lone sentence "add it from the menu" or similar filler — the
+  // tap message always has a real item name between "add" and "from".
+  const between = trimmed.slice(4, trimmed.indexOf(" from "));
+  if (between.trim().length < 2) return false;
+  return true;
+}
+
+const REORDER_PHRASES = [
+  "reorder",
+  "re-order",
+  "my usual",
+  "the usual",
+  "same as last",
+  "same as before",
+  "same thing",
+  "order it again",
+  "order again",
+  "again please",
+];
+
+function isReorderMessage(msgLower: string): boolean {
+  return REORDER_PHRASES.some((p) => msgLower.includes(p));
+}
 
 // ----- Confirmation-phrase gate (place_order) ------------------------------
 // The model is required to quote a confirmation word from the user's latest
@@ -174,7 +213,7 @@ export const tools = {
 
   build_cart: tool({
     description:
-      "Add items to the user's cart. Call this ONLY when the user has explicitly selected the items — either by naming a specific item in their message, or by tapping a menu checkbox (which arrives as 'Add <item> from <restaurant>'). Do NOT call this on vague prompts like 'pizza', 'I'm hungry', 'order me something'; in those cases show the menu and ask first. Every item must carry user_selection_evidence — the exact phrase from the user's message that selects that specific item. A cuisine word is NOT valid evidence for a specific item. Replaces any existing cart from a different restaurant. This tool already returns a full cart card AND records the summary timestamp required by the place_order gate — do NOT also call get_cart_summary on the same turn.",
+      "Add items to the user's cart. Call this ONLY when the user_intent_message is either (a) a frontend-emitted checkbox tap of the form 'Add <Item name> from <Restaurant name>' (this is what the menu card produces when the user taps an item), or (b) an explicit reorder phrase like 'my usual', 'same as last time', or 'order it again'. Free-text mentions of items ('large pepperoni', 'get me a margherita', 'order a pizza') do NOT qualify — in those cases call get_restaurant_menu and stop, letting the user tap the item they want. Every item must carry user_selection_evidence — the exact item-name phrase from the user's message. A cuisine word or generic phrase is NOT valid evidence. Replaces any existing cart from a different restaurant. This tool already returns a full cart card AND records the summary timestamp required by the place_order gate — do NOT also call get_cart_summary on the same turn.",
     parameters: z.object({
       restaurant_id: z.string(),
       user_intent_message: z
@@ -225,6 +264,34 @@ export const tools = {
           kind: "error" as const,
           message:
             "Cart not updated: missing user_intent_message. Do not call build_cart unless the user has selected items in their latest message. Show the menu and ask them to pick.",
+        };
+      }
+
+      // Primary gate: the user_intent_message MUST be either a frontend-
+      // emitted checkbox-tap ("Add <Item> from <Restaurant>") or a reorder
+      // phrase. Free-text item names like "order me a large pepperoni" do
+      // NOT qualify — product rule is that we never put items in a cart the
+      // user didn't tap. The prompt tells the model to show the menu and
+      // stop in that case; this is the runtime enforcement.
+      const isTap = isCheckboxTapMessage(intentLower);
+      const isReorder = isReorderMessage(intentLower);
+      if (!isTap && !isReorder) {
+        await storage.recordCartAudit({
+          session_id: sid,
+          outcome: "rejected",
+          restaurant_id,
+          item_count: items.length,
+          user_intent_message,
+          evidence: items.map((i) => ({
+            item_id: i.item_id,
+            phrase: i.user_selection_evidence,
+          })),
+          reject_reason: `no_explicit_selection:${intentLower.slice(0, 60)}`,
+        });
+        return {
+          kind: "error" as const,
+          message:
+            "Cart not updated: the user has not explicitly selected items yet. Call get_restaurant_menu and wait for them to tap a menu item (which will arrive as 'Add <Item> from <Restaurant>') or invoke a reorder phrase like 'my usual'. A free-text mention of an item name is not sufficient.",
         };
       }
 
