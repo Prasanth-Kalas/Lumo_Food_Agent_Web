@@ -3,6 +3,11 @@ import { streamText, convertToCoreMessages } from "ai";
 import { buildSystemPrompt, inferMetroFromAddress } from "@/lib/system-prompt";
 import { tools } from "@/lib/tools";
 import { METROS, type Metro } from "@/lib/types";
+import {
+  DEFAULT_SESSION_ID,
+  runWithSession,
+  sanitizeSessionId,
+} from "@/lib/session-context";
 
 // Next.js App Router streaming route.
 // The mobile app and the web UI both hit this endpoint.
@@ -41,6 +46,14 @@ export async function POST(req: Request) {
     // no bullets/markdown). Defaults to false for backward compatibility.
     const voiceMode: boolean = body.voiceMode === true;
 
+    // Per-device sessionId. Mobile generates and persists a UUID in
+    // AsyncStorage; legacy callers (and the web route for now) don't send
+    // one — they collapse onto "demo" so existing behavior is preserved.
+    const sessionId =
+      typeof body.sessionId === "string"
+        ? sanitizeSessionId(body.sessionId)
+        : DEFAULT_SESSION_ID;
+
     const activeMetros = parseServiceMetros();
     const serviceCities = activeMetros
       .map((m) => METROS[m].label)
@@ -58,16 +71,20 @@ export async function POST(req: Request) {
       voiceMode,
     });
 
-    const result = streamText({
-      model: anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
-      system: systemPrompt,
-      messages: convertToCoreMessages(messages),
-      tools,
-      maxSteps: 6,
-      temperature: 0.3,
+    // Bind sessionId to the async context. AsyncLocalStorage propagates
+    // through the streaming machinery, so every tool `execute()` the AI SDK
+    // invokes while consuming the response inherits this session.
+    return runWithSession(sessionId, () => {
+      const result = streamText({
+        model: anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+        system: systemPrompt,
+        messages: convertToCoreMessages(messages),
+        tools,
+        maxSteps: 6,
+        temperature: 0.3,
+      });
+      return result.toDataStreamResponse();
     });
-
-    return result.toDataStreamResponse();
   } catch (err) {
     console.error("[/api/chat] error", err);
     return new Response(

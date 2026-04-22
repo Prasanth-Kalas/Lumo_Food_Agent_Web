@@ -26,12 +26,14 @@ import {
 import { getStorage } from "./storage";
 import { getPublishableKey, getStripe, hasStripe } from "./stripe";
 import { METROS, type Cart, type Order } from "./types";
+import { getSessionId } from "./session-context";
 
-function sessionId() {
-  // In the MVP, every request from the frontend sends a sessionId cookie/header.
-  // For now we pin everything to "demo". Wire a real session cookie before
-  // we let more than one user in at a time — otherwise carts cross-pollinate.
-  return "demo";
+// Per-request sessionId — resolved from AsyncLocalStorage inside runWithSession,
+// which /api/chat sets up on every POST. Falls back to "demo" when unset, so
+// the web route (and ad-hoc tool invocations) keep working unchanged until we
+// ship a matching web-side sessionId.
+function sessionId(): string {
+  return getSessionId();
 }
 
 // ----- Tools ----------------------------------------------------------------
