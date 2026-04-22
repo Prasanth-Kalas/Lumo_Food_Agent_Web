@@ -101,7 +101,7 @@ export const tools = {
 
   build_cart: tool({
     description:
-      "Add items to the user's cart. Call this once you've found the items the user wants. Replaces any existing cart from a different restaurant.",
+      "Add items to the user's cart. Call this once you've found the items the user wants. Replaces any existing cart from a different restaurant. IMPORTANT: this tool already returns a full cart card to the user and records the summary timestamp required by the place_order gate — do NOT also call get_cart_summary on the same turn.",
     parameters: z.object({
       restaurant_id: z.string(),
       items: z
