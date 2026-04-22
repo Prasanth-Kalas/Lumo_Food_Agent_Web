@@ -1,11 +1,12 @@
 "use client";
 
 import { useChat } from "ai/react";
-import { useEffect, useRef, useState } from "react";
-import { Mic, Send, Sparkles } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Mic, MicOff, Send, Sparkles, Volume2, VolumeX } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MessageBubble } from "@/components/MessageBubble";
 import { ToolResultRenderer } from "@/components/ToolResultRenderer";
+import { useVoice } from "@/hooks/useVoice";
 
 const SUGGESTIONS = [
   "Order a large pepperoni pizza",
@@ -14,10 +15,13 @@ const SUGGESTIONS = [
   "Something vegetarian, under $20",
 ];
 
+const VOICE_MODE_KEY = "lumo.voiceMode";
+
 export default function ChatPage() {
   const {
     messages,
     input,
+    setInput,
     handleInputChange,
     handleSubmit,
     isLoading,
@@ -27,6 +31,49 @@ export default function ChatPage() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showSuggestions, setShowSuggestions] = useState(true);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const lastSpokenIdRef = useRef<string | null>(null);
+
+  // Restore voice mode pref from localStorage
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(VOICE_MODE_KEY);
+      if (saved === "1") setVoiceMode(true);
+    } catch {}
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(VOICE_MODE_KEY, voiceMode ? "1" : "0");
+    } catch {}
+  }, [voiceMode]);
+
+  const handleFinalTranscript = useCallback(
+    (text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      setInput("");
+      append({ role: "user", content: clean });
+    },
+    [append, setInput]
+  );
+
+  const voice = useVoice({
+    onFinalTranscript: handleFinalTranscript,
+    onInterimTranscript: (t) => setInput(t),
+  });
+
+  // Auto-speak new assistant messages when voice mode is on.
+  useEffect(() => {
+    if (!voiceMode) return;
+    if (isLoading) return; // wait until streaming done
+    if (!messages.length) return;
+    const last = messages[messages.length - 1];
+    if (last.role !== "assistant") return;
+    if (!last.content) return;
+    if (lastSpokenIdRef.current === last.id) return;
+    lastSpokenIdRef.current = last.id;
+    voice.speak(last.content);
+  }, [messages, isLoading, voiceMode, voice]);
 
   useEffect(() => {
     if (messages.length > 0) setShowSuggestions(false);
@@ -36,9 +83,31 @@ export default function ChatPage() {
     });
   }, [messages]);
 
+  const toggleVoiceMode = () => {
+    setVoiceMode((v) => {
+      const next = !v;
+      if (!next) voice.silence();
+      return next;
+    });
+  };
+
+  const onMicClick = () => {
+    if (voice.isListening) {
+      voice.stop();
+    } else {
+      // If assistant is mid-speech, the hook will barge-in and cancel it.
+      voice.start();
+    }
+  };
+
   return (
     <main className="flex min-h-dvh flex-col bg-gradient-to-b from-ink-50 to-white">
-      <Header />
+      <Header
+        voiceMode={voiceMode}
+        onToggleVoice={toggleVoiceMode}
+        voiceSupported={voice.support.tts || voice.support.stt}
+        isSpeaking={voice.isSpeaking}
+      />
 
       <div
         ref={scrollRef}
@@ -89,12 +158,26 @@ export default function ChatPage() {
         onSubmit={handleSubmit}
         isLoading={isLoading}
         onStop={stop}
+        onMicClick={onMicClick}
+        isListening={voice.isListening}
+        sttSupported={voice.support.stt}
+        interim={voice.interim}
       />
     </main>
   );
 }
 
-function Header() {
+function Header({
+  voiceMode,
+  onToggleVoice,
+  voiceSupported,
+  isSpeaking,
+}: {
+  voiceMode: boolean;
+  onToggleVoice: () => void;
+  voiceSupported: boolean;
+  isSpeaking: boolean;
+}) {
   return (
     <header className="safe-top sticky top-0 z-10 border-b border-ink-100 bg-white/80 backdrop-blur">
       <div className="mx-auto flex w-full max-w-2xl items-center justify-between px-4 py-3 sm:px-6">
@@ -107,7 +190,39 @@ function Header() {
             <div className="text-xs text-ink-500">Austin, TX · open now</div>
           </div>
         </div>
-        <div className="text-xs text-ink-500">v0.1 · demo</div>
+        <div className="flex items-center gap-3">
+          {voiceSupported && (
+            <button
+              type="button"
+              onClick={onToggleVoice}
+              aria-pressed={voiceMode}
+              aria-label={
+                voiceMode
+                  ? "Voice mode on — tap to mute"
+                  : "Voice mode off — tap to enable spoken replies"
+              }
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition",
+                voiceMode
+                  ? "border-lumo-300 bg-lumo-50 text-lumo-700"
+                  : "border-ink-200 bg-white text-ink-500 hover:text-ink-700"
+              )}
+            >
+              {voiceMode ? (
+                <Volume2
+                  className={cn(
+                    "h-3.5 w-3.5",
+                    isSpeaking && "animate-pulse text-lumo-600"
+                  )}
+                />
+              ) : (
+                <VolumeX className="h-3.5 w-3.5" />
+              )}
+              Voice
+            </button>
+          )}
+          <div className="text-xs text-ink-500">v0.1 · demo</div>
+        </div>
       </div>
     </header>
   );
@@ -146,7 +261,15 @@ function Composer(props: {
   onSubmit: (e: React.FormEvent<HTMLFormElement>) => void;
   isLoading: boolean;
   onStop: () => void;
+  onMicClick: () => void;
+  isListening: boolean;
+  sttSupported: boolean;
+  interim: string;
 }) {
+  const displayValue = props.isListening && props.interim
+    ? props.interim
+    : props.value;
+
   return (
     <div className="safe-bottom sticky bottom-0 border-t border-ink-100 bg-white/95 backdrop-blur">
       <form
@@ -155,17 +278,50 @@ function Composer(props: {
       >
         <button
           type="button"
-          aria-label="Voice input (coming soon)"
-          disabled
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-ink-200 bg-white text-ink-400 opacity-60"
+          aria-label={
+            !props.sttSupported
+              ? "Voice input not supported in this browser"
+              : props.isListening
+                ? "Stop listening"
+                : "Start voice input"
+          }
+          onClick={props.onMicClick}
+          disabled={!props.sttSupported}
+          className={cn(
+            "relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full border transition",
+            !props.sttSupported
+              ? "border-ink-200 bg-white text-ink-400 opacity-60"
+              : props.isListening
+                ? "border-lumo-400 bg-lumo-50 text-lumo-700"
+                : "border-ink-200 bg-white text-ink-600 hover:border-lumo-300 hover:text-lumo-700"
+          )}
         >
-          <Mic className="h-5 w-5" />
+          {props.isListening ? (
+            <>
+              <Mic className="h-5 w-5" />
+              <span className="absolute inset-0 animate-pulse rounded-full ring-2 ring-lumo-400/60" />
+            </>
+          ) : !props.sttSupported ? (
+            <MicOff className="h-5 w-5" />
+          ) : (
+            <Mic className="h-5 w-5" />
+          )}
         </button>
         <input
-          value={props.value}
+          value={displayValue}
           onChange={props.onChange}
-          placeholder="What are you hungry for?"
-          className="min-w-0 flex-1 rounded-full border border-ink-200 bg-white px-4 py-3 text-[15px] text-ink-900 shadow-card placeholder:text-ink-400 focus:border-lumo-400 focus:outline-none focus:ring-2 focus:ring-lumo-100"
+          placeholder={
+            props.isListening
+              ? "Listening…"
+              : "What are you hungry for?"
+          }
+          className={cn(
+            "min-w-0 flex-1 rounded-full border bg-white px-4 py-3 text-[15px] text-ink-900 shadow-card placeholder:text-ink-400 focus:outline-none focus:ring-2",
+            props.isListening
+              ? "border-lumo-400 focus:border-lumo-400 focus:ring-lumo-100"
+              : "border-ink-200 focus:border-lumo-400 focus:ring-lumo-100"
+          )}
+          readOnly={props.isListening}
         />
         <button
           type={props.isLoading ? "button" : "submit"}
