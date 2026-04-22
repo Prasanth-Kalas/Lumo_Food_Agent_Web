@@ -1,0 +1,19 @@
+{
+  "name": "Lumo — order food by chat",
+  "short_name": "Lumo",
+  "description": "Order food in seconds. Just tell Lumo what you want and it handles the rest.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#fafbff",
+  "theme_color": "#4361ee",
+  "categories": ["food", "lifestyle", "productivity"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
