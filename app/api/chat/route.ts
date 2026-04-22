@@ -36,6 +36,10 @@ export async function POST(req: Request) {
       address: "123 Main St, Austin, TX 78701",
       dietary: "No restrictions",
     };
+    // Client tells us whether replies will be spoken. When true we inject
+    // a directive telling the agent to write for TTS (prose, contractions,
+    // no bullets/markdown). Defaults to false for backward compatibility.
+    const voiceMode: boolean = body.voiceMode === true;
 
     const activeMetros = parseServiceMetros();
     const serviceCities = activeMetros
@@ -51,6 +55,7 @@ export async function POST(req: Request) {
       userMetro,
       userDietary: userProfile.dietary,
       today: new Date().toISOString().slice(0, 10),
+      voiceMode,
     });
 
     const result = streamText({

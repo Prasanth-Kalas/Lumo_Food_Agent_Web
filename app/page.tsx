@@ -18,6 +18,8 @@ const SUGGESTIONS = [
 const VOICE_MODE_KEY = "lumo.voiceMode";
 
 export default function ChatPage() {
+  const [voiceMode, setVoiceMode] = useState(false);
+
   const {
     messages,
     input,
@@ -27,11 +29,15 @@ export default function ChatPage() {
     isLoading,
     stop,
     append,
-  } = useChat({ api: "/api/chat" });
+  } = useChat({
+    api: "/api/chat",
+    // `body` is merged into every request. Changing voiceMode mid-session
+    // is safe — useChat re-reads the closure on each send.
+    body: { voiceMode },
+  });
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showSuggestions, setShowSuggestions] = useState(true);
-  const [voiceMode, setVoiceMode] = useState(false);
   const lastSpokenIdRef = useRef<string | null>(null);
 
   // Restore voice mode pref from localStorage
