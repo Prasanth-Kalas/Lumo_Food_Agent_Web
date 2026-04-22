@@ -1,11 +1,14 @@
 "use client";
 
+import { useState } from "react";
 import type { ToolInvocation } from "ai";
 import {
   Check,
   ChefHat,
   Clock,
   MapPin,
+  Minus,
+  Plus,
   ShoppingBag,
   Star,
   Truck,
@@ -70,9 +73,10 @@ export function ToolResultRenderer({
 
     case "menu":
       return (
-        <MenuPreview
+        <MenuCard
           restaurantName={result.restaurant_name}
           items={result.items}
+          onAdd={onQuickReply}
         />
       );
 
@@ -255,46 +259,144 @@ function RestaurantCard({
 }
 
 // -------------------------------------------------------------------------
-// Menu preview (first few items, so user can confirm they've got the right spot)
+// Menu card — interactive multi-select (mirrors the mobile MenuCard).
+//
+// Each row has a checkbox on the left and a price on the right. Tapping a
+// row (or the checkbox) adds qty=1 and morphs the checkbox into a compact
+// [− N +] stepper in Lumo blue. A sticky footer CTA summarizes the
+// selection and sends a single natural-language message to the agent
+// ('Add to cart: 2× Large Pepperoni, Garlic Knots.'). The agent already
+// has the menu in context from the preceding get_restaurant_menu call,
+// so it resolves names → item_ids reliably. After tap, local qty resets
+// — the cart summary card that follows supersedes this one anyway.
 // -------------------------------------------------------------------------
 
-function MenuPreview({
+function MenuCard({
   restaurantName,
   items,
+  onAdd,
 }: {
   restaurantName: string;
   items: MenuItem[];
+  onAdd: (text: string) => void;
 }) {
-  const preview = items.slice(0, 4);
-  const more = Math.max(0, items.length - preview.length);
+  const [qty, setQty] = useState<Record<string, number>>({});
+
+  const selectedItems = items.filter((item) => (qty[item.id] ?? 0) > 0);
+  const selectedCount = selectedItems.reduce(
+    (sum, item) => sum + (qty[item.id] ?? 0),
+    0
+  );
+  const selectedTotal = selectedItems.reduce(
+    (sum, item) => sum + (qty[item.id] ?? 0) * item.price_cents,
+    0
+  );
+
+  const inc = (id: string) =>
+    setQty((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
+  const dec = (id: string) =>
+    setQty((prev) => {
+      const next = (prev[id] ?? 0) - 1;
+      if (next <= 0) {
+        const { [id]: _drop, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [id]: next };
+    });
+
+  const handleAdd = () => {
+    if (selectedCount === 0) return;
+    const parts = selectedItems.map((item) => {
+      const n = qty[item.id]!;
+      return n === 1 ? item.name : `${n}× ${item.name}`;
+    });
+    onAdd(`Add to cart: ${parts.join(", ")}.`);
+    setQty({});
+  };
+
   return (
     <div className="animate-fade-in rounded-2xl border border-ink-100 bg-white p-3 shadow-card">
       <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-ink-900">
         <Utensils className="h-4 w-4 text-lumo-500" />
         {restaurantName} menu
       </div>
+
       <ul className="divide-y divide-ink-100">
-        {preview.map((item) => (
-          <li key={item.id} className="flex items-start gap-3 py-2">
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-ink-900">
-                {item.name}
-              </div>
-              {item.description && (
-                <div className="mt-0.5 line-clamp-2 text-xs text-ink-500">
-                  {item.description}
+        {items.map((item) => {
+          const n = qty[item.id] ?? 0;
+          const checked = n > 0;
+          return (
+            <li key={item.id} className="flex items-center gap-3 py-2.5">
+              {/* Left control: checkbox or stepper */}
+              {checked ? (
+                <div className="inline-flex h-[22px] shrink-0 items-center rounded-full border border-lumo-200 bg-lumo-50 px-0.5">
+                  <button
+                    type="button"
+                    onClick={() => dec(item.id)}
+                    aria-label={`Remove one ${item.name}`}
+                    className="flex h-[22px] w-[22px] items-center justify-center rounded-full text-ink-700 transition hover:bg-lumo-100"
+                  >
+                    <Minus className="h-3 w-3" />
+                  </button>
+                  <span className="min-w-[14px] px-0.5 text-center text-xs font-bold text-lumo-700 tabular-nums">
+                    {n}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => inc(item.id)}
+                    aria-label={`Add another ${item.name}`}
+                    className="flex h-[22px] w-[22px] items-center justify-center rounded-full text-ink-700 transition hover:bg-lumo-100"
+                  >
+                    <Plus className="h-3 w-3" />
+                  </button>
                 </div>
+              ) : (
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={false}
+                  aria-label={`Add ${item.name}`}
+                  onClick={() => inc(item.id)}
+                  className="h-[22px] w-[22px] shrink-0 rounded-md border-[1.5px] border-ink-300 bg-white transition hover:border-lumo-400 focus:border-lumo-500 focus:outline-none"
+                />
               )}
-            </div>
-            <div className="shrink-0 text-sm font-semibold text-ink-900">
-              {formatPrice(item.price_cents)}
-            </div>
-          </li>
-        ))}
+
+              {/* Main body: clicking it when unchecked adds qty=1 */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!checked) inc(item.id);
+                }}
+                className="min-w-0 flex-1 text-left"
+              >
+                <div className="truncate text-sm font-medium text-ink-900">
+                  {item.name}
+                </div>
+                {item.description && (
+                  <div className="mt-0.5 line-clamp-2 text-xs text-ink-500">
+                    {item.description}
+                  </div>
+                )}
+              </button>
+
+              <div className="shrink-0 text-sm font-semibold text-ink-900 tabular-nums">
+                {formatPrice(item.price_cents)}
+              </div>
+            </li>
+          );
+        })}
       </ul>
-      {more > 0 && (
-        <div className="mt-1 text-center text-xs text-ink-400">
-          +{more} more item{more === 1 ? "" : "s"}
+
+      {selectedCount > 0 && (
+        <div className="mt-2 border-t border-ink-100 pt-2.5">
+          <button
+            type="button"
+            onClick={handleAdd}
+            className="w-full rounded-full bg-lumo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-soft transition hover:bg-lumo-600 active:bg-lumo-700"
+          >
+            Add {selectedCount} item{selectedCount === 1 ? "" : "s"} ·{" "}
+            {formatPrice(selectedTotal)}
+          </button>
         </div>
       )}
     </div>
