@@ -5,6 +5,12 @@
  *   - a Zod parameter schema (for runtime validation and LLM SDK introspection)
  *   - an async execute() that returns the tool result to the model
  *
+ * State persistence:
+ *   Cart, order history, and the confirmation gate timestamp all go through
+ *   the LumoStorage interface in ./storage.ts. That picks Postgres when
+ *   DATABASE_URL is set (production on Vercel) and falls back to in-memory
+ *   Maps when it isn't (local dev without env pull).
+ *
  * The confirmation gate for place_order is enforced HERE, not just in the
  * system prompt, because LLMs occasionally skip instructions. Defense in depth.
  */
@@ -17,18 +23,13 @@ import {
   getMenuMock,
   findItemMock,
 } from "./mock-data";
+import { getStorage } from "./storage";
 import type { Cart, Order } from "./types";
-
-// ----- In-memory session state (per-request, demo-grade) --------------------
-// For the real product this lives in Redis or Postgres keyed by user session.
-// For the MVP demo, keeping it in a module-level Map is fine.
-const sessionCarts = new Map<string, Cart>();
-const sessionOrders = new Map<string, Order[]>();
-const sessionLastSummary = new Map<string, number>(); // track last cart summary ts
 
 function sessionId() {
   // In the MVP, every request from the frontend sends a sessionId cookie/header.
-  // For now we pin everything to "demo".
+  // For now we pin everything to "demo". Wire a real session cookie before
+  // we let more than one user in at a time — otherwise carts cross-pollinate.
   return "demo";
 }
 
@@ -152,8 +153,9 @@ export const tools = {
         eta_minutes: restaurant.eta_minutes,
       };
 
-      sessionCarts.set(sessionId(), cart);
-      sessionLastSummary.set(sessionId(), Date.now());
+      const storage = getStorage();
+      await storage.setCart(sessionId(), cart);
+      await storage.setLastSummaryAt(sessionId(), Date.now());
 
       return { kind: "cart" as const, cart };
     },
@@ -164,11 +166,12 @@ export const tools = {
       "Show the current cart to the user. Always call this before asking the user to confirm an order — the confirmation gate requires a visible cart summary immediately before place_order.",
     parameters: z.object({}),
     execute: async () => {
-      const cart = sessionCarts.get(sessionId());
+      const storage = getStorage();
+      const cart = await storage.getCart(sessionId());
       if (!cart) {
         return { kind: "empty_cart" as const };
       }
-      sessionLastSummary.set(sessionId(), Date.now());
+      await storage.setLastSummaryAt(sessionId(), Date.now());
       return { kind: "cart" as const, cart };
     },
   }),
@@ -198,8 +201,10 @@ export const tools = {
         };
       }
 
+      const storage = getStorage();
+
       // The summary must have been shown in the last ~60 seconds.
-      const lastSummary = sessionLastSummary.get(sessionId());
+      const lastSummary = await storage.getLastSummaryAt(sessionId());
       if (!lastSummary || Date.now() - lastSummary > 60_000) {
         return {
           kind: "error" as const,
@@ -208,7 +213,7 @@ export const tools = {
         };
       }
 
-      const cart = sessionCarts.get(sessionId());
+      const cart = await storage.getCart(sessionId());
       if (!cart) {
         return { kind: "error" as const, message: "Cart is empty." };
       }
@@ -224,13 +229,11 @@ export const tools = {
         ).toISOString(),
       };
 
-      const history = sessionOrders.get(sessionId()) ?? [];
-      history.unshift(order);
-      sessionOrders.set(sessionId(), history);
+      await storage.addOrder(sessionId(), order);
 
       // Clear cart after successful order.
-      sessionCarts.delete(sessionId());
-      sessionLastSummary.delete(sessionId());
+      await storage.clearCart(sessionId());
+      await storage.clearLastSummaryAt(sessionId());
 
       return { kind: "order_placed" as const, order };
     },
@@ -242,8 +245,8 @@ export const tools = {
       order_id: z.string(),
     }),
     execute: async ({ order_id }) => {
-      const history = sessionOrders.get(sessionId()) ?? [];
-      const order = history.find((o) => o.id === order_id);
+      const storage = getStorage();
+      const order = await storage.findOrder(sessionId(), order_id);
       if (!order) {
         return { kind: "error" as const, message: "Order not found." };
       }
@@ -258,8 +261,9 @@ export const tools = {
       limit: z.number().int().positive().max(10).optional().default(3),
     }),
     execute: async ({ limit }) => {
-      const history = (sessionOrders.get(sessionId()) ?? []).slice(0, limit);
-      return { kind: "order_history" as const, orders: history };
+      const storage = getStorage();
+      const orders = await storage.getOrderHistory(sessionId(), limit);
+      return { kind: "order_history" as const, orders };
     },
   }),
 };

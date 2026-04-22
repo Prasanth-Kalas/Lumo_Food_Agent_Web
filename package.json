@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^1.0.6",
+    "@neondatabase/serverless": "^0.10.4",
     "ai": "^4.0.20",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
