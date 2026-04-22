@@ -22,6 +22,26 @@
 import { ensureSchema, getSql, hasDb } from "./db";
 import type { Cart, Order, PaymentIntentRecord } from "./types";
 
+/**
+ * One row per build_cart attempt — accepted or rejected. Drives the prod
+ * audit surface on /api/lumo-verify so we can prove the evidence gate is
+ * being honored without exposing row data.
+ */
+export interface CartAddAuditEntry {
+  session_id: string;
+  outcome: "accepted" | "rejected";
+  restaurant_id: string | null;
+  item_count: number;
+  user_intent_message: string;
+  evidence: Array<{ item_id: string; phrase: string }>;
+  reject_reason?: string | null;
+}
+
+export interface CartAddAuditRow extends CartAddAuditEntry {
+  id: number;
+  created_at: string;
+}
+
 export interface LumoStorage {
   getCart(sessionId: string): Promise<Cart | null>;
   setCart(sessionId: string, cart: Cart): Promise<void>;
@@ -40,6 +60,14 @@ export interface LumoStorage {
   getPaymentIntent(sessionId: string): Promise<PaymentIntentRecord | null>;
   setPaymentIntent(sessionId: string, rec: PaymentIntentRecord): Promise<void>;
   clearPaymentIntent(sessionId: string): Promise<void>;
+
+  /** Sprint D — append-only cart_add audit trail. Never throws; log-only. */
+  recordCartAudit(entry: CartAddAuditEntry): Promise<void>;
+  getRecentCartAudit(
+    sessionId: string,
+    limit?: number
+  ): Promise<CartAddAuditRow[]>;
+  countCartAudit(outcome?: "accepted" | "rejected"): Promise<number>;
 }
 
 // ---------- In-memory implementation --------------------------------------
@@ -49,6 +77,8 @@ class MemoryStorage implements LumoStorage {
   private orders = new Map<string, Order[]>();
   private summaries = new Map<string, number>();
   private paymentIntents = new Map<string, PaymentIntentRecord>();
+  private cartAudit: CartAddAuditRow[] = [];
+  private cartAuditSeq = 0;
 
   async getCart(sessionId: string) {
     return this.carts.get(sessionId) ?? null;
@@ -92,6 +122,27 @@ class MemoryStorage implements LumoStorage {
   }
   async clearPaymentIntent(sessionId: string) {
     this.paymentIntents.delete(sessionId);
+  }
+
+  async recordCartAudit(entry: CartAddAuditEntry) {
+    this.cartAuditSeq += 1;
+    this.cartAudit.unshift({
+      id: this.cartAuditSeq,
+      ...entry,
+      reject_reason: entry.reject_reason ?? null,
+      created_at: new Date().toISOString(),
+    });
+    // Cap memory footprint; real durability is Postgres only.
+    if (this.cartAudit.length > 500) this.cartAudit.length = 500;
+  }
+  async getRecentCartAudit(sessionId: string, limit = 5) {
+    return this.cartAudit
+      .filter((r) => r.session_id === sessionId)
+      .slice(0, limit);
+  }
+  async countCartAudit(outcome?: "accepted" | "rejected") {
+    if (!outcome) return this.cartAudit.length;
+    return this.cartAudit.filter((r) => r.outcome === outcome).length;
   }
 }
 
@@ -277,6 +328,83 @@ class PostgresStorage implements LumoStorage {
     if (!sql) return;
     await ensureSchema();
     await sql`DELETE FROM payment_intents WHERE session_id = ${sessionId}`;
+  }
+
+  async recordCartAudit(entry: CartAddAuditEntry): Promise<void> {
+    const sql = getSql();
+    if (!sql) return;
+    await ensureSchema();
+    // Trim the user intent to a sane cap so a runaway tool call can't
+    // balloon the row. 2kB is more than any legitimate chat turn.
+    const intent = (entry.user_intent_message ?? "").slice(0, 2048);
+    await sql`
+      INSERT INTO cart_add_audit (
+        session_id, outcome, restaurant_id, item_count,
+        user_intent_message, evidence, reject_reason
+      ) VALUES (
+        ${entry.session_id},
+        ${entry.outcome},
+        ${entry.restaurant_id ?? null},
+        ${entry.item_count},
+        ${intent},
+        ${JSON.stringify(entry.evidence)}::jsonb,
+        ${entry.reject_reason ?? null}
+      )
+    `;
+  }
+
+  async getRecentCartAudit(
+    sessionId: string,
+    limit = 5
+  ): Promise<CartAddAuditRow[]> {
+    const sql = getSql();
+    if (!sql) return [];
+    await ensureSchema();
+    const rows = (await sql`
+      SELECT id, session_id, outcome, restaurant_id, item_count,
+             user_intent_message, evidence, reject_reason, created_at
+      FROM cart_add_audit
+      WHERE session_id = ${sessionId}
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `) as Array<{
+      id: number | string;
+      session_id: string;
+      outcome: "accepted" | "rejected";
+      restaurant_id: string | null;
+      item_count: number | string;
+      user_intent_message: string;
+      evidence: Array<{ item_id: string; phrase: string }>;
+      reject_reason: string | null;
+      created_at: Date | string;
+    }>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      session_id: r.session_id,
+      outcome: r.outcome,
+      restaurant_id: r.restaurant_id,
+      item_count: Number(r.item_count),
+      user_intent_message: r.user_intent_message,
+      evidence: r.evidence,
+      reject_reason: r.reject_reason,
+      created_at: toIso(r.created_at),
+    }));
+  }
+
+  async countCartAudit(outcome?: "accepted" | "rejected"): Promise<number> {
+    const sql = getSql();
+    if (!sql) return 0;
+    await ensureSchema();
+    if (outcome) {
+      const rows = (await sql`
+        SELECT COUNT(*)::int AS count FROM cart_add_audit WHERE outcome = ${outcome}
+      `) as Array<{ count: number }>;
+      return Number(rows[0]?.count ?? 0);
+    }
+    const rows = (await sql`
+      SELECT COUNT(*)::int AS count FROM cart_add_audit
+    `) as Array<{ count: number }>;
+    return Number(rows[0]?.count ?? 0);
   }
 }
 

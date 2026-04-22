@@ -102,6 +102,27 @@ export async function ensureSchema(): Promise<void> {
     await sql`
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_intent_id TEXT
     `;
+    // Sprint D guardrail: audit every build_cart call so we can prove in prod
+    // that the evidence gate is being respected. Append-only, tiny rows.
+    // Includes accepted AND rejected attempts so we can see when the model
+    // tried to add without proper evidence.
+    await sql`
+      CREATE TABLE IF NOT EXISTS cart_add_audit (
+        id                  BIGSERIAL PRIMARY KEY,
+        session_id          TEXT NOT NULL,
+        outcome             TEXT NOT NULL,
+        restaurant_id       TEXT,
+        item_count          INTEGER NOT NULL,
+        user_intent_message TEXT NOT NULL,
+        evidence            JSONB NOT NULL,
+        reject_reason       TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE INDEX IF NOT EXISTS cart_add_audit_session_created_idx
+      ON cart_add_audit (session_id, created_at DESC)
+    `;
   })().catch((err) => {
     // Don't poison the promise cache if migration fails — next call retries.
     migrationPromise = null;

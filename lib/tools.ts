@@ -36,6 +36,49 @@ function sessionId(): string {
   return getSessionId();
 }
 
+// ----- Cart-add evidence gate -----------------------------------------------
+// Words that describe a cuisine / vague craving, not a specific item. If the
+// model quotes any of these as user_selection_evidence for a specific item,
+// we reject — the user has to actually pick something. This list is narrow on
+// purpose: it only catches the single-word generic case. Real item names like
+// "pepperoni pizza", "margherita", "thai green curry" pass through because
+// they're multi-word OR name a specific dish.
+const GENERIC_PHRASES = new Set<string>([
+  "food", "anything", "something", "whatever", "surprise", "surprise me",
+  "hungry", "order", "order something", "order me something", "dinner",
+  "lunch", "breakfast", "brunch", "a meal", "meal", "the usual", "usual",
+  "pizza", "pasta", "burger", "burgers", "sushi", "curry", "tacos",
+  "thai", "indian", "chinese", "mexican", "italian", "japanese", "korean",
+  "vietnamese", "mediterranean", "american", "dessert", "drinks", "a drink",
+  "coffee", "tea", "yes", "go", "ok", "sure", "sounds good", "confirm",
+]);
+
+/**
+ * True when the entire user message is a vague cuisine / mood ping. In that
+ * case we refuse to build a cart no matter what the model claims as evidence:
+ * there is no valid per-item selection in a 1-3 word craving ("pizza" /
+ * "I'm hungry" / "thai food tonight"). Show the menu and ask.
+ */
+function isVagueUserIntent(intentLower: string): boolean {
+  // Strip punctuation and collapse whitespace so "pizza!" matches "pizza".
+  const cleaned = intentLower.replace(/[^a-z0-9' ]/g, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) return true;
+  if (GENERIC_PHRASES.has(cleaned)) return true;
+  // 1–3 words AND every token is in the generic list → vague.
+  const tokens = cleaned.split(" ").filter(Boolean);
+  if (tokens.length > 0 && tokens.length <= 3) {
+    const everyTokenGeneric = tokens.every(
+      (t) =>
+        GENERIC_PHRASES.has(t) ||
+        t === "i" || t === "i'm" || t === "im" || t === "am" ||
+        t === "for" || t === "please" || t === "want" || t === "tonight" ||
+        t === "now" || t === "today"
+    );
+    if (everyTokenGeneric) return true;
+  }
+  return false;
+}
+
 // ----- Tools ----------------------------------------------------------------
 
 export const tools = {
@@ -111,9 +154,15 @@ export const tools = {
 
   build_cart: tool({
     description:
-      "Add items to the user's cart. Call this once you've found the items the user wants. Replaces any existing cart from a different restaurant. IMPORTANT: this tool already returns a full cart card to the user and records the summary timestamp required by the place_order gate — do NOT also call get_cart_summary on the same turn.",
+      "Add items to the user's cart. Call this ONLY when the user has explicitly selected the items — either by naming a specific item in their message, or by tapping a menu checkbox (which arrives as 'Add <item> from <restaurant>'). Do NOT call this on vague prompts like 'pizza', 'I'm hungry', 'order me something'; in those cases show the menu and ask first. Every item must carry user_selection_evidence — the exact phrase from the user's message that selects that specific item. A cuisine word is NOT valid evidence for a specific item. Replaces any existing cart from a different restaurant. This tool already returns a full cart card AND records the summary timestamp required by the place_order gate — do NOT also call get_cart_summary on the same turn.",
     parameters: z.object({
       restaurant_id: z.string(),
+      user_intent_message: z
+        .string()
+        .min(1)
+        .describe(
+          "Quote the user's most recent message verbatim. This is the message that justifies calling build_cart. Stored for audit."
+        ),
       items: z
         .array(
           z.object({
@@ -121,11 +170,129 @@ export const tools = {
             quantity: z.number().int().positive().default(1),
             modifiers: z.record(z.string()).optional(),
             notes: z.string().optional(),
+            user_selection_evidence: z
+              .string()
+              .min(2)
+              .describe(
+                "Exact phrase from the user's most recent message that selects THIS specific item. E.g. 'large pepperoni', 'margherita', 'a side of garlic knots'. A bare cuisine word like 'pizza' is NOT valid — show the menu and ask instead."
+              ),
           })
         )
         .min(1),
     }),
-    execute: async ({ restaurant_id, items }) => {
+    execute: async ({ restaurant_id, items, user_intent_message }) => {
+      const storage = getStorage();
+      const sid = sessionId();
+
+      // -- Evidence gate --------------------------------------------------
+      // Reject in code before mutating state. This is the belt to the prompt's
+      // suspenders — LLMs skip instructions, so we verify here.
+      const intentLower = (user_intent_message ?? "").trim().toLowerCase();
+      if (!intentLower) {
+        await storage.recordCartAudit({
+          session_id: sid,
+          outcome: "rejected",
+          restaurant_id,
+          item_count: items.length,
+          user_intent_message: user_intent_message ?? "",
+          evidence: items.map((i) => ({
+            item_id: i.item_id,
+            phrase: i.user_selection_evidence ?? "",
+          })),
+          reject_reason: "missing_user_intent_message",
+        });
+        return {
+          kind: "error" as const,
+          message:
+            "Cart not updated: missing user_intent_message. Do not call build_cart unless the user has selected items in their latest message. Show the menu and ask them to pick.",
+        };
+      }
+
+      // If the user's entire message is a generic cuisine / vague intent,
+      // we refuse regardless of what the model claimed as evidence.
+      if (isVagueUserIntent(intentLower)) {
+        await storage.recordCartAudit({
+          session_id: sid,
+          outcome: "rejected",
+          restaurant_id,
+          item_count: items.length,
+          user_intent_message,
+          evidence: items.map((i) => ({
+            item_id: i.item_id,
+            phrase: i.user_selection_evidence,
+          })),
+          reject_reason: `vague_user_intent:${intentLower.slice(0, 40)}`,
+        });
+        return {
+          kind: "error" as const,
+          message:
+            "Cart not updated: the user's message is too vague to justify adding specific items. Call get_restaurant_menu and let the user pick items by name or checkbox.",
+        };
+      }
+
+      // Per-item evidence check. Each phrase must (1) not be a generic
+      // cuisine word, and (2) appear in the user's message (case-insensitive
+      // substring match — the model must be quoting the user, not inventing).
+      for (const req of items) {
+        const phrase = (req.user_selection_evidence ?? "").trim().toLowerCase();
+        if (!phrase || phrase.length < 2) {
+          await storage.recordCartAudit({
+            session_id: sid,
+            outcome: "rejected",
+            restaurant_id,
+            item_count: items.length,
+            user_intent_message,
+            evidence: items.map((i) => ({
+              item_id: i.item_id,
+              phrase: i.user_selection_evidence,
+            })),
+            reject_reason: `empty_evidence:${req.item_id}`,
+          });
+          return {
+            kind: "error" as const,
+            message: `Cart not updated: missing user_selection_evidence for item ${req.item_id}. Ask the user to name the item they want.`,
+          };
+        }
+        if (GENERIC_PHRASES.has(phrase)) {
+          await storage.recordCartAudit({
+            session_id: sid,
+            outcome: "rejected",
+            restaurant_id,
+            item_count: items.length,
+            user_intent_message,
+            evidence: items.map((i) => ({
+              item_id: i.item_id,
+              phrase: i.user_selection_evidence,
+            })),
+            reject_reason: `generic_evidence:${phrase}`,
+          });
+          return {
+            kind: "error" as const,
+            message: `Cart not updated: "${phrase}" is a cuisine or generic word, not an item-level selection. Show the menu and ask the user to pick a specific item.`,
+          };
+        }
+        if (!intentLower.includes(phrase)) {
+          await storage.recordCartAudit({
+            session_id: sid,
+            outcome: "rejected",
+            restaurant_id,
+            item_count: items.length,
+            user_intent_message,
+            evidence: items.map((i) => ({
+              item_id: i.item_id,
+              phrase: i.user_selection_evidence,
+            })),
+            reject_reason: `fabricated_evidence:${phrase}`,
+          });
+          return {
+            kind: "error" as const,
+            message: `Cart not updated: user_selection_evidence "${phrase}" is not present in the user's latest message. Do not fabricate quotes. Ask the user to confirm the item by name.`,
+          };
+        }
+      }
+
+      // -- End evidence gate ----------------------------------------------
+
       const restaurant = getRestaurantByIdMock(restaurant_id);
       if (!restaurant) {
         return { kind: "error" as const, message: "Restaurant not found." };
@@ -167,9 +334,19 @@ export const tools = {
         eta_minutes: restaurant.eta_minutes,
       };
 
-      const storage = getStorage();
-      await storage.setCart(sessionId(), cart);
-      await storage.setLastSummaryAt(sessionId(), Date.now());
+      await storage.setCart(sid, cart);
+      await storage.setLastSummaryAt(sid, Date.now());
+      await storage.recordCartAudit({
+        session_id: sid,
+        outcome: "accepted",
+        restaurant_id,
+        item_count: items.length,
+        user_intent_message,
+        evidence: items.map((i) => ({
+          item_id: i.item_id,
+          phrase: i.user_selection_evidence,
+        })),
+      });
 
       return { kind: "cart" as const, cart };
     },

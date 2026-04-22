@@ -25,7 +25,11 @@
 import { NextResponse } from "next/server";
 import { ensureSchema, getSql, hasDb } from "@/lib/db";
 import { sanitizeSessionId } from "@/lib/session-context";
-import { storageBackend } from "@/lib/storage";
+import {
+  getStorage,
+  storageBackend,
+  type CartAddAuditRow,
+} from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -41,8 +45,13 @@ interface VerifyResponse {
     cart_snapshots: number | null;
     payment_intents: number | null;
     confirmation_gates: number | null;
+    cart_add_audit: number | null;
   };
   latest_order_at: string | null;
+  cart_add_audit: {
+    accepted: number;
+    rejected: number;
+  };
   session: null | {
     session_id: string;
     cart_present: boolean;
@@ -52,6 +61,16 @@ interface VerifyResponse {
       status: string;
       placed_at: string;
     };
+    recent_cart_audit: Array<{
+      id: number;
+      outcome: "accepted" | "rejected";
+      restaurant_id: string | null;
+      item_count: number;
+      user_intent_message: string;
+      evidence: Array<{ item_id: string; phrase: string }>;
+      reject_reason: string | null;
+      created_at: string;
+    }>;
   };
   checked_at: string;
 }
@@ -72,8 +91,10 @@ export async function GET(req: Request) {
       cart_snapshots: null,
       payment_intents: null,
       confirmation_gates: null,
+      cart_add_audit: null,
     },
     latest_order_at: null,
+    cart_add_audit: { accepted: 0, rejected: 0 },
     session: null,
     checked_at: new Date().toISOString(),
   };
@@ -116,16 +137,22 @@ export async function GET(req: Request) {
   try {
     const counts = (await sql`
       SELECT
-        (SELECT COUNT(*) FROM orders)              AS orders,
-        (SELECT COUNT(*) FROM cart_snapshots)      AS carts,
-        (SELECT COUNT(*) FROM payment_intents)     AS pis,
-        (SELECT COUNT(*) FROM confirmation_gates)  AS gates,
-        (SELECT MAX(placed_at) FROM orders)        AS latest
+        (SELECT COUNT(*) FROM orders)                                           AS orders,
+        (SELECT COUNT(*) FROM cart_snapshots)                                   AS carts,
+        (SELECT COUNT(*) FROM payment_intents)                                  AS pis,
+        (SELECT COUNT(*) FROM confirmation_gates)                               AS gates,
+        (SELECT COUNT(*) FROM cart_add_audit)                                   AS audit_total,
+        (SELECT COUNT(*) FROM cart_add_audit WHERE outcome = 'accepted')        AS audit_accepted,
+        (SELECT COUNT(*) FROM cart_add_audit WHERE outcome = 'rejected')        AS audit_rejected,
+        (SELECT MAX(placed_at) FROM orders)                                     AS latest
     `) as Array<{
       orders: string | number;
       carts: string | number;
       pis: string | number;
       gates: string | number;
+      audit_total: string | number;
+      audit_accepted: string | number;
+      audit_rejected: string | number;
       latest: Date | string | null;
     }>;
     const c = counts[0];
@@ -134,6 +161,9 @@ export async function GET(req: Request) {
       out.tables.cart_snapshots = Number(c.carts);
       out.tables.payment_intents = Number(c.pis);
       out.tables.confirmation_gates = Number(c.gates);
+      out.tables.cart_add_audit = Number(c.audit_total);
+      out.cart_add_audit.accepted = Number(c.audit_accepted);
+      out.cart_add_audit.rejected = Number(c.audit_rejected);
       out.latest_order_at = c.latest
         ? typeof c.latest === "string"
           ? c.latest
@@ -174,6 +204,9 @@ export async function GET(req: Request) {
       `) as Array<{ count: number }>;
 
       const latest = ordersRows[0];
+      const recentAudit: CartAddAuditRow[] = await getStorage()
+        .getRecentCartAudit(sessionId, 5)
+        .catch(() => []);
       out.session = {
         session_id: sessionId,
         cart_present: Boolean(cartRow),
@@ -188,6 +221,16 @@ export async function GET(req: Request) {
                   : latest.placed_at.toISOString(),
             }
           : null,
+        recent_cart_audit: recentAudit.map((r) => ({
+          id: r.id,
+          outcome: r.outcome,
+          restaurant_id: r.restaurant_id,
+          item_count: r.item_count,
+          user_intent_message: r.user_intent_message,
+          evidence: r.evidence,
+          reject_reason: r.reject_reason ?? null,
+          created_at: r.created_at,
+        })),
       };
     } catch (err) {
       out.ok = false;
