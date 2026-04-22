@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { cn, formatEta, formatPrice } from "@/lib/utils";
 import type { Cart, MenuItem, Order, Restaurant } from "@/lib/types";
+import { PaymentForm } from "./PaymentForm";
 
 /**
  * Renders rich, tappable cards for every tool result the agent emits.
@@ -42,6 +43,15 @@ export function ToolResultRenderer({
     | { kind: "menu"; restaurant_id: string; restaurant_name: string; items: MenuItem[] }
     | { kind: "cart"; cart: Cart }
     | { kind: "empty_cart" }
+    | {
+        kind: "payment_required";
+        payment_intent_id: string;
+        client_secret: string;
+        amount_cents: number;
+        currency: string;
+        publishable_key: string | null;
+      }
+    | { kind: "payment_skipped"; reason: string; amount_cents: number }
     | { kind: "order_placed"; order: Order }
     | { kind: "order_status"; order: Order }
     | { kind: "order_history"; orders: Order[] }
@@ -84,6 +94,28 @@ export function ToolResultRenderer({
         />
       );
 
+    case "payment_required":
+      return (
+        <PaymentForm
+          clientSecret={result.client_secret}
+          publishableKey={result.publishable_key}
+          amountCents={result.amount_cents}
+          onPaid={() => onQuickReply("payment confirmed")}
+        />
+      );
+
+    case "payment_skipped":
+      // Demo / cash-on-delivery path — agent proceeds without card entry.
+      return (
+        <InfoCard
+          icon={<ShoppingBag className="h-4 w-4" />}
+          title="Paying on delivery"
+          body={`No card required in demo mode. Total ${formatPrice(
+            result.amount_cents
+          )}.`}
+        />
+      );
+
     case "order_placed":
       return <OrderConfirmation order={result.order} />;
 
@@ -118,6 +150,7 @@ function WorkingPill({ toolName }: { toolName: string }) {
     get_restaurant_menu: "Loading menu…",
     build_cart: "Building your cart…",
     get_cart_summary: "Reviewing your cart…",
+    create_payment_intent: "Setting up payment…",
     place_order: "Placing your order…",
     get_order_status: "Checking status…",
     get_order_history: "Pulling recent orders…",
