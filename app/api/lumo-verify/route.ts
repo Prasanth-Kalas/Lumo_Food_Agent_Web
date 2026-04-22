@@ -29,6 +29,7 @@ import {
   getStorage,
   storageBackend,
   type CartAddAuditRow,
+  type PaymentAuditRow,
 } from "@/lib/storage";
 
 export const runtime = "nodejs";
@@ -46,12 +47,20 @@ interface VerifyResponse {
     payment_intents: number | null;
     confirmation_gates: number | null;
     cart_add_audit: number | null;
+    payment_attempt_audit: number | null;
   };
   latest_order_at: string | null;
   cart_add_audit: {
     accepted: number;
     rejected: number;
   };
+  /**
+   * Outcome histogram for payment_attempt_audit — keys are the outcome enum
+   * values from storage.ts (pi_created, order_refunded_amount_mismatch, etc).
+   * Missing keys = zero. Exposed so we can confirm the new guards are firing
+   * in prod without reading row-level data.
+   */
+  payment_attempt_audit: Record<string, number>;
   session: null | {
     session_id: string;
     cart_present: boolean;
@@ -69,6 +78,15 @@ interface VerifyResponse {
       user_intent_message: string;
       evidence: Array<{ item_id: string; phrase: string }>;
       reject_reason: string | null;
+      created_at: string;
+    }>;
+    recent_payment_audit: Array<{
+      id: number;
+      stage: string;
+      outcome: string;
+      payment_intent_id: string | null;
+      amount_cents: number | null;
+      reason: string | null;
       created_at: string;
     }>;
   };
@@ -92,9 +110,11 @@ export async function GET(req: Request) {
       payment_intents: null,
       confirmation_gates: null,
       cart_add_audit: null,
+      payment_attempt_audit: null,
     },
     latest_order_at: null,
     cart_add_audit: { accepted: 0, rejected: 0 },
+    payment_attempt_audit: {},
     session: null,
     checked_at: new Date().toISOString(),
   };
@@ -144,6 +164,7 @@ export async function GET(req: Request) {
         (SELECT COUNT(*) FROM cart_add_audit)                                   AS audit_total,
         (SELECT COUNT(*) FROM cart_add_audit WHERE outcome = 'accepted')        AS audit_accepted,
         (SELECT COUNT(*) FROM cart_add_audit WHERE outcome = 'rejected')        AS audit_rejected,
+        (SELECT COUNT(*) FROM payment_attempt_audit)                            AS pay_audit_total,
         (SELECT MAX(placed_at) FROM orders)                                     AS latest
     `) as Array<{
       orders: string | number;
@@ -153,6 +174,7 @@ export async function GET(req: Request) {
       audit_total: string | number;
       audit_accepted: string | number;
       audit_rejected: string | number;
+      pay_audit_total: string | number;
       latest: Date | string | null;
     }>;
     const c = counts[0];
@@ -162,6 +184,7 @@ export async function GET(req: Request) {
       out.tables.payment_intents = Number(c.pis);
       out.tables.confirmation_gates = Number(c.gates);
       out.tables.cart_add_audit = Number(c.audit_total);
+      out.tables.payment_attempt_audit = Number(c.pay_audit_total);
       out.cart_add_audit.accepted = Number(c.audit_accepted);
       out.cart_add_audit.rejected = Number(c.audit_rejected);
       out.latest_order_at = c.latest
@@ -170,6 +193,10 @@ export async function GET(req: Request) {
           : c.latest.toISOString()
         : null;
     }
+    // Outcome histogram — one row per distinct outcome.
+    out.payment_attempt_audit = await getStorage()
+      .countPaymentAuditByOutcome()
+      .catch(() => ({}));
   } catch (err) {
     out.ok = false;
     return NextResponse.json(
@@ -204,8 +231,12 @@ export async function GET(req: Request) {
       `) as Array<{ count: number }>;
 
       const latest = ordersRows[0];
-      const recentAudit: CartAddAuditRow[] = await getStorage()
+      const storage = getStorage();
+      const recentAudit: CartAddAuditRow[] = await storage
         .getRecentCartAudit(sessionId, 5)
+        .catch(() => []);
+      const recentPayAudit: PaymentAuditRow[] = await storage
+        .getRecentPaymentAudit(sessionId, 10)
         .catch(() => []);
       out.session = {
         session_id: sessionId,
@@ -229,6 +260,15 @@ export async function GET(req: Request) {
           user_intent_message: r.user_intent_message,
           evidence: r.evidence,
           reject_reason: r.reject_reason ?? null,
+          created_at: r.created_at,
+        })),
+        recent_payment_audit: recentPayAudit.map((r) => ({
+          id: r.id,
+          stage: r.stage,
+          outcome: r.outcome,
+          payment_intent_id: r.payment_intent_id ?? null,
+          amount_cents: r.amount_cents ?? null,
+          reason: r.reason ?? null,
           created_at: r.created_at,
         })),
       };

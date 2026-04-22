@@ -42,6 +42,53 @@ export interface CartAddAuditRow extends CartAddAuditEntry {
   created_at: string;
 }
 
+/**
+ * One row per payment-related attempt across create_payment_intent and
+ * place_order. Stage tells which tool emitted it, outcome is a short
+ * machine-readable code, reason is free-form context (truncated). Used to
+ * expose payment health on /api/lumo-verify without leaking any card or
+ * customer detail.
+ */
+export type PaymentAuditStage =
+  | "create_payment_intent"
+  | "place_order";
+
+export type PaymentAuditOutcome =
+  // create_payment_intent
+  | "pi_created"
+  | "pi_reused"
+  | "pi_canceled_stale"
+  | "pi_skipped_demo"
+  | "pi_error_no_cart"
+  | "pi_error_stripe"
+  | "pi_error_no_secret"
+  // place_order
+  | "order_rejected_no_confirmation"
+  | "order_rejected_unknown_phrase"
+  | "order_rejected_fabricated_phrase"
+  | "order_rejected_no_summary"
+  | "order_rejected_empty_cart"
+  | "order_rejected_no_pi"
+  | "order_rejected_pi_status"
+  | "order_rejected_amount_mismatch"
+  | "order_refunded_amount_mismatch"
+  | "order_refund_failed"
+  | "order_placed";
+
+export interface PaymentAuditEntry {
+  session_id: string;
+  stage: PaymentAuditStage;
+  outcome: PaymentAuditOutcome;
+  payment_intent_id?: string | null;
+  amount_cents?: number | null;
+  reason?: string | null;
+}
+
+export interface PaymentAuditRow extends PaymentAuditEntry {
+  id: number;
+  created_at: string;
+}
+
 export interface LumoStorage {
   getCart(sessionId: string): Promise<Cart | null>;
   setCart(sessionId: string, cart: Cart): Promise<void>;
@@ -68,6 +115,14 @@ export interface LumoStorage {
     limit?: number
   ): Promise<CartAddAuditRow[]>;
   countCartAudit(outcome?: "accepted" | "rejected"): Promise<number>;
+
+  /** Sprint D — append-only payment_attempt audit trail. Log-only. */
+  recordPaymentAudit(entry: PaymentAuditEntry): Promise<void>;
+  getRecentPaymentAudit(
+    sessionId: string,
+    limit?: number
+  ): Promise<PaymentAuditRow[]>;
+  countPaymentAuditByOutcome(): Promise<Record<string, number>>;
 }
 
 // ---------- In-memory implementation --------------------------------------
@@ -79,6 +134,8 @@ class MemoryStorage implements LumoStorage {
   private paymentIntents = new Map<string, PaymentIntentRecord>();
   private cartAudit: CartAddAuditRow[] = [];
   private cartAuditSeq = 0;
+  private payAudit: PaymentAuditRow[] = [];
+  private payAuditSeq = 0;
 
   async getCart(sessionId: string) {
     return this.carts.get(sessionId) ?? null;
@@ -143,6 +200,31 @@ class MemoryStorage implements LumoStorage {
   async countCartAudit(outcome?: "accepted" | "rejected") {
     if (!outcome) return this.cartAudit.length;
     return this.cartAudit.filter((r) => r.outcome === outcome).length;
+  }
+
+  async recordPaymentAudit(entry: PaymentAuditEntry) {
+    this.payAuditSeq += 1;
+    this.payAudit.unshift({
+      id: this.payAuditSeq,
+      ...entry,
+      payment_intent_id: entry.payment_intent_id ?? null,
+      amount_cents: entry.amount_cents ?? null,
+      reason: entry.reason ?? null,
+      created_at: new Date().toISOString(),
+    });
+    if (this.payAudit.length > 500) this.payAudit.length = 500;
+  }
+  async getRecentPaymentAudit(sessionId: string, limit = 5) {
+    return this.payAudit
+      .filter((r) => r.session_id === sessionId)
+      .slice(0, limit);
+  }
+  async countPaymentAuditByOutcome() {
+    const buckets: Record<string, number> = {};
+    for (const r of this.payAudit) {
+      buckets[r.outcome] = (buckets[r.outcome] ?? 0) + 1;
+    }
+    return buckets;
   }
 }
 
@@ -405,6 +487,75 @@ class PostgresStorage implements LumoStorage {
       SELECT COUNT(*)::int AS count FROM cart_add_audit
     `) as Array<{ count: number }>;
     return Number(rows[0]?.count ?? 0);
+  }
+
+  async recordPaymentAudit(entry: PaymentAuditEntry): Promise<void> {
+    const sql = getSql();
+    if (!sql) return;
+    await ensureSchema();
+    // Cap reason length — Stripe error messages and refund notes can be long.
+    const reason = entry.reason ? entry.reason.slice(0, 512) : null;
+    await sql`
+      INSERT INTO payment_attempt_audit (
+        session_id, stage, outcome, payment_intent_id, amount_cents, reason
+      ) VALUES (
+        ${entry.session_id},
+        ${entry.stage},
+        ${entry.outcome},
+        ${entry.payment_intent_id ?? null},
+        ${entry.amount_cents ?? null},
+        ${reason}
+      )
+    `;
+  }
+
+  async getRecentPaymentAudit(
+    sessionId: string,
+    limit = 5
+  ): Promise<PaymentAuditRow[]> {
+    const sql = getSql();
+    if (!sql) return [];
+    await ensureSchema();
+    const rows = (await sql`
+      SELECT id, session_id, stage, outcome, payment_intent_id, amount_cents, reason, created_at
+      FROM payment_attempt_audit
+      WHERE session_id = ${sessionId}
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `) as Array<{
+      id: number | string;
+      session_id: string;
+      stage: PaymentAuditStage;
+      outcome: PaymentAuditOutcome;
+      payment_intent_id: string | null;
+      amount_cents: number | string | null;
+      reason: string | null;
+      created_at: Date | string;
+    }>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      session_id: r.session_id,
+      stage: r.stage,
+      outcome: r.outcome,
+      payment_intent_id: r.payment_intent_id,
+      amount_cents: r.amount_cents == null ? null : Number(r.amount_cents),
+      reason: r.reason,
+      created_at: toIso(r.created_at),
+    }));
+  }
+
+  async countPaymentAuditByOutcome(): Promise<Record<string, number>> {
+    const sql = getSql();
+    if (!sql) return {};
+    await ensureSchema();
+    const rows = (await sql`
+      SELECT outcome, COUNT(*)::int AS count
+      FROM payment_attempt_audit
+      GROUP BY outcome
+    `) as Array<{ outcome: string; count: number }>;
+    const buckets: Record<string, number> = {};
+    for (const r of rows) buckets[r.outcome] = Number(r.count);
+    return buckets;
   }
 }
 

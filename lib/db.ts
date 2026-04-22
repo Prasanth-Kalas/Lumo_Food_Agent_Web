@@ -123,6 +123,27 @@ export async function ensureSchema(): Promise<void> {
       CREATE INDEX IF NOT EXISTS cart_add_audit_session_created_idx
       ON cart_add_audit (session_id, created_at DESC)
     `;
+    // Sprint D guardrail (payment side): audit every create_payment_intent and
+    // place_order attempt. Same log-only, append-only pattern as cart_add_audit
+    // so we can answer "how often do we reject fabricated confirmations?" and
+    // "did the amount-mismatch refund path fire?" from /api/lumo-verify without
+    // leaking row-level data. Amount stored in cents, never card detail.
+    await sql`
+      CREATE TABLE IF NOT EXISTS payment_attempt_audit (
+        id                  BIGSERIAL PRIMARY KEY,
+        session_id          TEXT NOT NULL,
+        stage               TEXT NOT NULL,
+        outcome             TEXT NOT NULL,
+        payment_intent_id   TEXT,
+        amount_cents        INTEGER,
+        reason              TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE INDEX IF NOT EXISTS payment_attempt_audit_session_created_idx
+      ON payment_attempt_audit (session_id, created_at DESC)
+    `;
   })().catch((err) => {
     // Don't poison the promise cache if migration fails — next call retries.
     migrationPromise = null;
