@@ -187,7 +187,7 @@ function Header({
           </div>
           <div>
             <div className="text-sm font-semibold text-ink-900">Lumo</div>
-            <div className="text-xs text-ink-500">Austin, TX · open now</div>
+            <div className="text-xs text-ink-500">Austin · LA · SF · Chicago</div>
           </div>
         </div>
         <div className="flex items-center gap-3">

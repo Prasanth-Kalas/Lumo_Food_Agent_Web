@@ -25,7 +25,7 @@ import {
 } from "./mock-data";
 import { getStorage } from "./storage";
 import { getPublishableKey, getStripe, hasStripe } from "./stripe";
-import type { Cart, Order } from "./types";
+import { METROS, type Cart, type Order } from "./types";
 
 function sessionId() {
   // In the MVP, every request from the frontend sends a sessionId cookie/header.
@@ -56,11 +56,19 @@ export const tools = {
           "chinese",
           "american",
           "japanese",
+          "korean",
+          "vietnamese",
           "mediterranean",
           "breakfast",
           "dessert",
         ])
         .optional(),
+      metro: z
+        .enum(["austin", "los_angeles", "san_francisco", "chicago"])
+        .optional()
+        .describe(
+          "Scope results to a single metro. Always pass this based on the user's saved address."
+        ),
       sort: z
         .enum(["rating", "distance", "eta", "price_low"])
         .optional()
@@ -139,7 +147,10 @@ export const tools = {
 
       const deliveryFee = 299; // $2.99 — flat for MVP
       const serviceFee = Math.round(subtotal * 0.08); // 8% service fee
-      const tax = Math.round(subtotal * 0.0825); // Austin sales tax ~8.25%
+      // Sales tax derived from the restaurant's metro (TX 8.25, CA-LA 9.5,
+      // CA-SF 8.625, IL-Chicago 10.25 — see METROS in lib/types.ts).
+      const taxBps = METROS[restaurant.metro]?.salesTaxBps ?? 825;
+      const tax = Math.round((subtotal * taxBps) / 10_000);
       const total = subtotal + deliveryFee + serviceFee + tax;
 
       const cart: Cart = {
@@ -374,10 +385,17 @@ export const tools = {
         paymentIntentId = fresh.id;
       }
 
+      // Derive a plausible delivery address from the restaurant's metro so
+      // the order confirmation card looks coherent across markets.
+      const restaurantMetro = getRestaurantByIdMock(cart.restaurant_id)?.metro;
+      const demoAddress = restaurantMetro
+        ? `123 Main St, ${METROS[restaurantMetro].label} (demo)`
+        : "123 Main St (demo)";
+
       const order: Order = {
         id: "ord_" + Math.random().toString(36).slice(2, 10),
         cart,
-        address: "123 Main St, Austin, TX (demo)",
+        address: demoAddress,
         placed_at: new Date().toISOString(),
         status: "placed",
         estimated_delivery_at: new Date(

@@ -1,6 +1,6 @@
 # Lumo — order food by chat
 
-A chat-first food ordering agent for the US market, starting in **Austin, TX**.
+A chat-first food ordering agent for the US market. Currently live in **Austin, TX · Los Angeles, CA · San Francisco, CA · Chicago, IL**.
 The user talks to the agent in natural language ("I want Thai food tonight") and
 the agent resolves the restaurant, builds the cart, reviews it, and places the
 order — all in one thread.
@@ -28,7 +28,7 @@ lumo-food-agent/
 ├── lib/
 │   ├── system-prompt.ts      # The agent's brain (rules, tone, guardrails)
 │   ├── tools.ts              # 7 tools: search → menu → cart → confirm → order
-│   ├── mock-data.ts          # 10 Austin restaurants + full menus
+│   ├── mock-data.ts          # 22 restaurants across Austin / LA / SF / Chicago
 │   ├── types.ts              # Cart / Order / Restaurant shapes
 │   └── utils.ts              # cn(), formatPrice(), formatEta()
 ├── public/
@@ -86,7 +86,9 @@ Everything runs against `lib/mock-data.ts` — no MealMe keys needed.
 |---|---|---|
 | `ANTHROPIC_API_KEY` | yes | From console.anthropic.com |
 | `ANTHROPIC_MODEL` | no | Defaults to `claude-sonnet-4-6` |
-| `SERVICE_CITY` | no | Defaults to `Austin, TX`. The agent politely declines orders outside this. |
+| `SERVICE_METROS` | no | Comma-separated slugs (`austin,los_angeles,san_francisco,chicago`). Unset = all four. |
+| `DEEPGRAM_API_KEY` | for voice | Powers STT (Nova-3, en-US). |
+| `OPENAI_API_KEY` | for voice | Powers TTS (`gpt-4o-mini-tts`). |
 
 ---
 
@@ -178,8 +180,9 @@ Every one of these is a single-file change because the interfaces are stable.
 - **Confirmation gate** — `place_order` refuses without an explicit user
   confirmation word AND a recent cart summary. Enforced in code, not just the
   system prompt.
-- **Service-area lock** — `SERVICE_CITY` env var interpolates into the system
-  prompt; the agent declines orders outside Austin with a clear message.
+- **Service-area lock** — `SERVICE_METROS` env var scopes the system prompt
+  to the active metros (Austin, LA, SF, Chicago); the agent politely declines
+  orders outside those markets. Per-metro sales tax is applied at checkout.
 - **Substitution rules** — if a requested item is unavailable, the agent must
   propose a specific substitute and wait for approval before rebuilding the
   cart.

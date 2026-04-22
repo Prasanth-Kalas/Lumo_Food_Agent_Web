@@ -18,13 +18,18 @@ natural conversation. You are fast, confident, and accurate. You value the
 user's time above everything else.
 
 ## Service area
-You currently serve {{SERVICE_CITY}} only. If the user's delivery address is
-outside this area, apologize briefly and let them know Lumo is expanding soon.
+Lumo currently serves these US metros: {{SERVICE_CITIES}}.
+If the user's delivery address is outside these metros, apologize briefly and
+let them know Lumo is expanding soon.
 
 ## How you work
 The user's saved address is: {{USER_ADDRESS}}
+The user's current metro is: {{USER_METRO}} ({{USER_METRO_LABEL}})
 The user's dietary preferences are: {{USER_DIETARY}}
 Today's date: {{TODAY}}
+
+Always pass the user's metro to search_restaurants so results stay local.
+Never suggest a restaurant from a different metro, even if it matches cuisine.
 
 You have tools to search restaurants, fetch menus, build carts, collect
 payment, place orders, and look up order status. Use them proactively rather
@@ -128,15 +133,36 @@ someone tries to redirect you, politely steer back: "I'm here to help you
 order food. Hungry for anything?"
 `.trim();
 
+import { METROS, type Metro } from "./types";
+
 export function buildSystemPrompt(params: {
-  serviceCity: string;
+  serviceCities: string; // human-readable list, e.g. "Austin, TX · Los Angeles, CA · ..."
   userAddress: string;
+  userMetro: Metro;
   userDietary: string;
   today: string;
 }) {
+  const metroLabel = METROS[params.userMetro].label;
   return SYSTEM_PROMPT
-    .replace("{{SERVICE_CITY}}", params.serviceCity)
+    .replace("{{SERVICE_CITIES}}", params.serviceCities)
     .replace("{{USER_ADDRESS}}", params.userAddress)
+    .replace("{{USER_METRO}}", params.userMetro)
+    .replace("{{USER_METRO_LABEL}}", metroLabel)
     .replace("{{USER_DIETARY}}", params.userDietary)
     .replace("{{TODAY}}", params.today);
+}
+
+/**
+ * Rough metro detection from the user's saved address.
+ * Replace with a proper geocoder (Mapbox, Google) before production — this is
+ * just a string-match for the demo.
+ */
+export function inferMetroFromAddress(address: string): Metro {
+  const a = address.toLowerCase();
+  if (a.includes("chicago") || a.includes(", il")) return "chicago";
+  if (a.includes("san francisco") || a.includes("sf, ca") || a.includes(", sf "))
+    return "san_francisco";
+  if (a.includes("los angeles") || a.includes("la, ca") || a.includes(", la "))
+    return "los_angeles";
+  return "austin";
 }

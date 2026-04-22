@@ -11,14 +11,34 @@ export type Cuisine =
   | "chinese"
   | "american"
   | "japanese"
+  | "korean"
+  | "vietnamese"
   | "mediterranean"
   | "breakfast"
   | "dessert";
+
+/**
+ * Metros Lumo currently serves. Keep this list in sync with SERVICE_CITIES env
+ * and the tax table in lib/tools.ts.
+ */
+export type Metro = "austin" | "los_angeles" | "san_francisco" | "chicago";
+
+/** Metadata for each metro — label, state, and local sales tax (basis points). */
+export const METROS: Record<
+  Metro,
+  { label: string; state: string; salesTaxBps: number }
+> = {
+  austin: { label: "Austin, TX", state: "TX", salesTaxBps: 825 },
+  los_angeles: { label: "Los Angeles, CA", state: "CA", salesTaxBps: 950 },
+  san_francisco: { label: "San Francisco, CA", state: "CA", salesTaxBps: 862 },
+  chicago: { label: "Chicago, IL", state: "IL", salesTaxBps: 1025 },
+};
 
 export interface Restaurant {
   id: string;
   name: string;
   cuisine: Cuisine[];
+  metro: Metro;
   rating: number;
   review_count: number;
   price_level: 1 | 2 | 3 | 4;
