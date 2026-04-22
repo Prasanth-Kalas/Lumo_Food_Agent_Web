@@ -122,20 +122,44 @@ export default function ChatPage() {
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
           {messages.length === 0 && <EmptyState />}
 
-          {messages.map((msg) => (
-            <div key={msg.id} className="flex flex-col gap-2">
-              {msg.content && (
-                <MessageBubble role={msg.role}>{msg.content}</MessageBubble>
-              )}
-              {msg.toolInvocations?.map((tc) => (
-                <ToolResultRenderer
-                  key={tc.toolCallId}
-                  invocation={tc}
-                  onQuickReply={(text) => append({ role: "user", content: text })}
-                />
-              ))}
-            </div>
-          ))}
+          {messages.map((msg) => {
+            // Suppress a redundant restaurant-list card when the same
+            // assistant turn also produced a menu. See mobile for rationale.
+            const invs = msg.toolInvocations ?? [];
+            const hasMenu = invs.some(
+              (i) =>
+                (i as { result?: { kind?: string } }).result?.kind === "menu"
+            );
+            const visibleInvs = hasMenu
+              ? invs.filter(
+                  (i) =>
+                    (i as { result?: { kind?: string } }).result?.kind !==
+                    "restaurants"
+                )
+              : invs;
+            // Cheap pre-render glue-space fix: the Vercel AI SDK concatenates
+            // text segments across tool-call boundaries without inserting
+            // whitespace, so "near you!" + "Got" → "near you!Got". Patch it
+            // up before rendering. Regex targets sentence terminators fused
+            // to a following letter.
+            const displayContent = msg.content
+              ? msg.content.replace(/([.!?])([A-Z])/g, "$1 $2")
+              : msg.content;
+            return (
+              <div key={msg.id} className="flex flex-col gap-2">
+                {displayContent && (
+                  <MessageBubble role={msg.role}>{displayContent}</MessageBubble>
+                )}
+                {visibleInvs.map((tc) => (
+                  <ToolResultRenderer
+                    key={tc.toolCallId}
+                    invocation={tc}
+                    onQuickReply={(text) => append({ role: "user", content: text })}
+                  />
+                ))}
+              </div>
+            );
+          })}
 
           {isLoading && <TypingIndicator />}
         </div>
