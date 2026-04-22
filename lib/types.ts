@@ -70,4 +70,14 @@ export interface Order {
   placed_at: string;
   status: "placed" | "preparing" | "out_for_delivery" | "delivered" | "cancelled";
   estimated_delivery_at: string;
+  /** Stripe PaymentIntent id when Stripe is configured; omitted in the demo cash flow. */
+  payment_intent_id?: string;
+}
+
+/** Per-session snapshot of the current Stripe PaymentIntent. */
+export interface PaymentIntentRecord {
+  payment_intent_id: string;
+  client_secret: string;
+  amount_cents: number;
+  status: string;
 }

@@ -85,6 +85,23 @@ export async function ensureSchema(): Promise<void> {
         last_summary_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `;
+    // Sprint C: Stripe PaymentIntents. One active PI per session at a time;
+    // overwrite on cart changes so we never charge a stale amount.
+    await sql`
+      CREATE TABLE IF NOT EXISTS payment_intents (
+        session_id          TEXT PRIMARY KEY,
+        payment_intent_id   TEXT NOT NULL,
+        client_secret       TEXT NOT NULL,
+        amount_cents        INTEGER NOT NULL,
+        status              TEXT NOT NULL,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+    // Record the PI on the order for reconciliation.
+    await sql`
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_intent_id TEXT
+    `;
   })().catch((err) => {
     // Don't poison the promise cache if migration fails — next call retries.
     migrationPromise = null;

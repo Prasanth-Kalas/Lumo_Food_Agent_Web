@@ -24,6 +24,7 @@ import {
   findItemMock,
 } from "./mock-data";
 import { getStorage } from "./storage";
+import { getPublishableKey, getStripe, hasStripe } from "./stripe";
 import type { Cart, Order } from "./types";
 
 function sessionId() {
@@ -176,9 +177,112 @@ export const tools = {
     },
   }),
 
+  create_payment_intent: tool({
+    description:
+      "Create a Stripe PaymentIntent for the current cart so the user can enter card details. Call this AFTER showing the cart summary and AFTER the user signals they're ready to pay (e.g. 'ready to pay', 'let's checkout', 'place the order'). Returns a client_secret the frontend uses to collect payment. Do NOT call place_order until the frontend reports the payment has succeeded.",
+    parameters: z.object({}),
+    execute: async () => {
+      const storage = getStorage();
+      const cart = await storage.getCart(sessionId());
+      if (!cart) {
+        return { kind: "error" as const, message: "Cart is empty." };
+      }
+
+      // Demo / local path: no Stripe keys configured. Skip straight to the
+      // cash-on-delivery flow — the agent can call place_order next turn.
+      if (!hasStripe()) {
+        return {
+          kind: "payment_skipped" as const,
+          reason: "stripe_not_configured",
+          amount_cents: cart.total_cents,
+        };
+      }
+
+      const stripe = getStripe();
+      if (!stripe) {
+        return {
+          kind: "error" as const,
+          message:
+            "Payment backend misconfigured. Check STRIPE_SECRET_KEY.",
+        };
+      }
+
+      // Reuse an existing PI if the amount hasn't changed — avoids creating
+      // dead PIs every time the user edits the cart and comes back.
+      const existing = await storage.getPaymentIntent(sessionId());
+      if (
+        existing &&
+        existing.amount_cents === cart.total_cents &&
+        existing.status !== "succeeded" &&
+        existing.status !== "canceled"
+      ) {
+        return {
+          kind: "payment_required" as const,
+          payment_intent_id: existing.payment_intent_id,
+          client_secret: existing.client_secret,
+          amount_cents: existing.amount_cents,
+          currency: "usd",
+          publishable_key: getPublishableKey(),
+        };
+      }
+
+      // Either nothing exists, the amount changed, or the PI is terminal.
+      // Create a fresh one. If there's a stale non-terminal PI, cancel it
+      // so we don't leave orphaned authorizations in Stripe.
+      if (existing && existing.payment_intent_id !== "") {
+        try {
+          await stripe.paymentIntents.cancel(existing.payment_intent_id);
+        } catch {
+          // Non-fatal: PI may already be succeeded/canceled.
+        }
+      }
+
+      try {
+        const pi = await stripe.paymentIntents.create({
+          amount: cart.total_cents,
+          currency: "usd",
+          // Automatic payment methods = cards + any wallets the account has on.
+          automatic_payment_methods: { enabled: true },
+          metadata: {
+            session_id: sessionId(),
+            restaurant_id: cart.restaurant_id,
+            restaurant_name: cart.restaurant_name,
+          },
+          description: `Lumo order — ${cart.restaurant_name}`,
+        });
+
+        if (!pi.client_secret) {
+          return {
+            kind: "error" as const,
+            message: "Stripe returned no client_secret.",
+          };
+        }
+
+        await storage.setPaymentIntent(sessionId(), {
+          payment_intent_id: pi.id,
+          client_secret: pi.client_secret,
+          amount_cents: cart.total_cents,
+          status: pi.status,
+        });
+
+        return {
+          kind: "payment_required" as const,
+          payment_intent_id: pi.id,
+          client_secret: pi.client_secret,
+          amount_cents: cart.total_cents,
+          currency: "usd",
+          publishable_key: getPublishableKey(),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Unknown Stripe error";
+        return { kind: "error" as const, message: `Payment setup failed: ${msg}` };
+      }
+    },
+  }),
+
   place_order: tool({
     description:
-      "Place the order with the merchant. ONLY call this after you have shown a cart summary AND the user has explicitly confirmed (yes/confirm/place it/go ahead). The user's most recent message MUST contain an explicit confirmation.",
+      "Place the order with the merchant. ONLY call this after you have shown a cart summary AND the user has explicitly confirmed (yes/confirm/place it/go ahead). The user's most recent message MUST contain an explicit confirmation. When Stripe is configured, this will only succeed after the PaymentIntent has been paid by the client.",
     parameters: z.object({
       user_confirmed: z
         .boolean()
@@ -218,6 +322,58 @@ export const tools = {
         return { kind: "error" as const, message: "Cart is empty." };
       }
 
+      // Payment gate: when Stripe is configured, the PI must have succeeded
+      // before we commit the order. We re-check with Stripe (not just our
+      // cached status) because the client-side succeeded callback can lie.
+      let paymentIntentId: string | undefined;
+      if (hasStripe()) {
+        const stripe = getStripe();
+        const pi = await storage.getPaymentIntent(sessionId());
+        if (!stripe || !pi) {
+          return {
+            kind: "error" as const,
+            message:
+              "Order not placed: no payment on file. Call create_payment_intent first and have the user complete payment.",
+          };
+        }
+
+        let fresh;
+        try {
+          fresh = await stripe.paymentIntents.retrieve(pi.payment_intent_id);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Stripe error";
+          return {
+            kind: "error" as const,
+            message: `Payment lookup failed: ${msg}`,
+          };
+        }
+
+        if (fresh.status !== "succeeded") {
+          // Keep the cached status in sync for next attempt.
+          await storage.setPaymentIntent(sessionId(), {
+            payment_intent_id: fresh.id,
+            client_secret: pi.client_secret,
+            amount_cents: fresh.amount,
+            status: fresh.status,
+          });
+          return {
+            kind: "error" as const,
+            message: `Order not placed: payment status is "${fresh.status}". Ask the user to complete payment.`,
+          };
+        }
+
+        // Sanity check the charged amount matches the current cart.
+        if (fresh.amount !== cart.total_cents) {
+          return {
+            kind: "error" as const,
+            message:
+              "Order not placed: paid amount differs from current cart total. Cart likely changed after payment — ask the user to re-confirm and retry.",
+          };
+        }
+
+        paymentIntentId = fresh.id;
+      }
+
       const order: Order = {
         id: "ord_" + Math.random().toString(36).slice(2, 10),
         cart,
@@ -227,13 +383,15 @@ export const tools = {
         estimated_delivery_at: new Date(
           Date.now() + cart.eta_minutes * 60_000
         ).toISOString(),
+        ...(paymentIntentId ? { payment_intent_id: paymentIntentId } : {}),
       };
 
       await storage.addOrder(sessionId(), order);
 
-      // Clear cart after successful order.
+      // Clear cart + gate + PI after successful order.
       await storage.clearCart(sessionId());
       await storage.clearLastSummaryAt(sessionId());
+      await storage.clearPaymentIntent(sessionId());
 
       return { kind: "order_placed" as const, order };
     },

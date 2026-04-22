@@ -20,7 +20,7 @@
  */
 
 import { ensureSchema, getSql, hasDb } from "./db";
-import type { Cart, Order } from "./types";
+import type { Cart, Order, PaymentIntentRecord } from "./types";
 
 export interface LumoStorage {
   getCart(sessionId: string): Promise<Cart | null>;
@@ -35,6 +35,11 @@ export interface LumoStorage {
   getLastSummaryAt(sessionId: string): Promise<number | null>;
   setLastSummaryAt(sessionId: string, ts: number): Promise<void>;
   clearLastSummaryAt(sessionId: string): Promise<void>;
+
+  /** Sprint C — Stripe PaymentIntent per session (at most one active). */
+  getPaymentIntent(sessionId: string): Promise<PaymentIntentRecord | null>;
+  setPaymentIntent(sessionId: string, rec: PaymentIntentRecord): Promise<void>;
+  clearPaymentIntent(sessionId: string): Promise<void>;
 }
 
 // ---------- In-memory implementation --------------------------------------
@@ -43,6 +48,7 @@ class MemoryStorage implements LumoStorage {
   private carts = new Map<string, Cart>();
   private orders = new Map<string, Order[]>();
   private summaries = new Map<string, number>();
+  private paymentIntents = new Map<string, PaymentIntentRecord>();
 
   async getCart(sessionId: string) {
     return this.carts.get(sessionId) ?? null;
@@ -76,6 +82,16 @@ class MemoryStorage implements LumoStorage {
   }
   async clearLastSummaryAt(sessionId: string) {
     this.summaries.delete(sessionId);
+  }
+
+  async getPaymentIntent(sessionId: string) {
+    return this.paymentIntents.get(sessionId) ?? null;
+  }
+  async setPaymentIntent(sessionId: string, rec: PaymentIntentRecord) {
+    this.paymentIntents.set(sessionId, rec);
+  }
+  async clearPaymentIntent(sessionId: string) {
+    this.paymentIntents.delete(sessionId);
   }
 }
 
@@ -118,7 +134,7 @@ class PostgresStorage implements LumoStorage {
     if (!sql) return [];
     await ensureSchema();
     const rows = (await sql`
-      SELECT id, cart, address, status, placed_at, estimated_delivery_at
+      SELECT id, cart, address, status, placed_at, estimated_delivery_at, payment_intent_id
       FROM orders
       WHERE session_id = ${sessionId}
       ORDER BY placed_at DESC
@@ -130,6 +146,7 @@ class PostgresStorage implements LumoStorage {
       status: Order["status"];
       placed_at: Date | string;
       estimated_delivery_at: Date | string;
+      payment_intent_id: string | null;
     }>;
 
     return rows.map((r) => ({
@@ -139,6 +156,7 @@ class PostgresStorage implements LumoStorage {
       status: r.status,
       placed_at: toIso(r.placed_at),
       estimated_delivery_at: toIso(r.estimated_delivery_at),
+      ...(r.payment_intent_id ? { payment_intent_id: r.payment_intent_id } : {}),
     }));
   }
 
@@ -147,7 +165,7 @@ class PostgresStorage implements LumoStorage {
     if (!sql) return null;
     await ensureSchema();
     const rows = (await sql`
-      SELECT id, cart, address, status, placed_at, estimated_delivery_at
+      SELECT id, cart, address, status, placed_at, estimated_delivery_at, payment_intent_id
       FROM orders
       WHERE session_id = ${sessionId} AND id = ${orderId}
       LIMIT 1
@@ -158,6 +176,7 @@ class PostgresStorage implements LumoStorage {
       status: Order["status"];
       placed_at: Date | string;
       estimated_delivery_at: Date | string;
+      payment_intent_id: string | null;
     }>;
     const r = rows[0];
     if (!r) return null;
@@ -168,6 +187,7 @@ class PostgresStorage implements LumoStorage {
       status: r.status,
       placed_at: toIso(r.placed_at),
       estimated_delivery_at: toIso(r.estimated_delivery_at),
+      ...(r.payment_intent_id ? { payment_intent_id: r.payment_intent_id } : {}),
     };
   }
 
@@ -176,7 +196,7 @@ class PostgresStorage implements LumoStorage {
     if (!sql) return;
     await ensureSchema();
     await sql`
-      INSERT INTO orders (id, session_id, cart, address, status, placed_at, estimated_delivery_at)
+      INSERT INTO orders (id, session_id, cart, address, status, placed_at, estimated_delivery_at, payment_intent_id)
       VALUES (
         ${order.id},
         ${sessionId},
@@ -184,7 +204,8 @@ class PostgresStorage implements LumoStorage {
         ${order.address},
         ${order.status},
         ${order.placed_at},
-        ${order.estimated_delivery_at}
+        ${order.estimated_delivery_at},
+        ${order.payment_intent_id ?? null}
       )
     `;
   }
@@ -219,6 +240,43 @@ class PostgresStorage implements LumoStorage {
     if (!sql) return;
     await ensureSchema();
     await sql`DELETE FROM confirmation_gates WHERE session_id = ${sessionId}`;
+  }
+
+  async getPaymentIntent(sessionId: string): Promise<PaymentIntentRecord | null> {
+    const sql = getSql();
+    if (!sql) return null;
+    await ensureSchema();
+    const rows = (await sql`
+      SELECT payment_intent_id, client_secret, amount_cents, status
+      FROM payment_intents
+      WHERE session_id = ${sessionId}
+    `) as Array<PaymentIntentRecord>;
+    return rows[0] ?? null;
+  }
+
+  async setPaymentIntent(sessionId: string, rec: PaymentIntentRecord): Promise<void> {
+    const sql = getSql();
+    if (!sql) return;
+    await ensureSchema();
+    await sql`
+      INSERT INTO payment_intents
+        (session_id, payment_intent_id, client_secret, amount_cents, status, created_at, updated_at)
+      VALUES
+        (${sessionId}, ${rec.payment_intent_id}, ${rec.client_secret}, ${rec.amount_cents}, ${rec.status}, NOW(), NOW())
+      ON CONFLICT (session_id) DO UPDATE
+      SET payment_intent_id = EXCLUDED.payment_intent_id,
+          client_secret     = EXCLUDED.client_secret,
+          amount_cents      = EXCLUDED.amount_cents,
+          status            = EXCLUDED.status,
+          updated_at        = NOW()
+    `;
+  }
+
+  async clearPaymentIntent(sessionId: string): Promise<void> {
+    const sql = getSql();
+    if (!sql) return;
+    await ensureSchema();
+    await sql`DELETE FROM payment_intents WHERE session_id = ${sessionId}`;
   }
 }
 
