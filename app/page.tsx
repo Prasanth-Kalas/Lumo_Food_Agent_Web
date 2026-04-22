@@ -69,16 +69,27 @@ export default function ChatPage() {
   });
 
   // Auto-speak new assistant messages when voice mode is on.
+  //
+  // Progressive: call speakStreaming() on every re-render of the active
+  // message so the hook can start speaking as soon as the first
+  // sentence is in hand, instead of waiting for isLoading to flip
+  // false. That's what kills the "text appears, menu renders, THEN
+  // voice starts" latency.
+  //
+  // lastSpokenIdRef guards against re-speaking an already-closed
+  // message when unrelated renders happen.
   useEffect(() => {
     if (!voiceMode) return;
-    if (isLoading) return; // wait until streaming done
     if (!messages.length) return;
     const last = messages[messages.length - 1];
     if (last.role !== "assistant") return;
-    if (!last.content) return;
-    if (lastSpokenIdRef.current === last.id) return;
-    lastSpokenIdRef.current = last.id;
-    voice.speak(last.content);
+    const text = last.content ?? "";
+    // Skip fully-spoken messages on subsequent renders.
+    if (lastSpokenIdRef.current === last.id && !isLoading) return;
+    voice.speakStreaming(last.id, text, !isLoading);
+    if (!isLoading) {
+      lastSpokenIdRef.current = last.id;
+    }
   }, [messages, isLoading, voiceMode, voice]);
 
   useEffect(() => {

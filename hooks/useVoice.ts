@@ -36,6 +36,17 @@ export type UseVoiceReturn = {
   start: () => void;
   stop: () => void;
   speak: (text: string) => void;
+  /**
+   * Progressive TTS. Call this repeatedly as an assistant message
+   * streams in — the hook will fire `/api/tts` per completed sentence,
+   * append MP3 frames into a single MediaSource, and start playback as
+   * soon as the first chunk is ready. Time-to-first-audio is dominated
+   * by the first sentence boundary, not the full message length.
+   *
+   * Call with `isFinal=true` once streaming ends to flush any
+   * trailing unspoken text and close the MediaSource.
+   */
+  speakStreaming: (messageId: string, text: string, isFinal: boolean) => void;
   silence: () => void;
 };
 
@@ -99,6 +110,11 @@ export function useVoice(opts: UseVoiceOptions): UseVoiceReturn {
   const objectUrlRef = useRef<string | null>(null);
   const ttsAbortRef = useRef<AbortController | null>(null);
   const ttsReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+
+  // Progressive TTS session (for speakStreaming). Separate from the
+  // one-shot `speak()` state above so a late fallback to speak() can
+  // still work if a caller prefers it.
+  const streamSessionRef = useRef<StreamSession | null>(null);
 
   useEffect(() => {
     setSupport(detectSupport());
@@ -175,6 +191,18 @@ export function useVoice(opts: UseVoiceOptions): UseVoiceReturn {
 
     // Barge-in: kill any in-flight speech as soon as the user reaches
     // for the mic. This is what makes the agent feel interruptible.
+    // Covers both the one-shot `speak()` path and the progressive
+    // `speakStreaming()` path.
+    const sess = streamSessionRef.current;
+    if (sess) {
+      sess.disposed = true;
+      for (const ac of sess.aborts) {
+        try {
+          ac.abort();
+        } catch {}
+      }
+      streamSessionRef.current = null;
+    }
     silenceTts(
       audioElRef,
       mediaSourceRef,
@@ -343,6 +371,30 @@ export function useVoice(opts: UseVoiceOptions): UseVoiceReturn {
   }, []);
 
   const silence = useCallback(() => {
+    // Kill both the one-shot speak() path AND the progressive
+    // speakStreaming() path so barge-in works regardless of which one
+    // is active.
+    const sess = streamSessionRef.current;
+    if (sess) {
+      sess.disposed = true;
+      for (const ac of sess.aborts) {
+        try {
+          ac.abort();
+        } catch {}
+      }
+      try {
+        sess.audio.pause();
+        sess.audio.src = "";
+        sess.audio.load();
+      } catch {}
+      try {
+        if (sess.ms.readyState === "open") sess.ms.endOfStream();
+      } catch {}
+      try {
+        URL.revokeObjectURL(sess.url);
+      } catch {}
+      streamSessionRef.current = null;
+    }
     teardownTts();
   }, [teardownTts]);
 
@@ -471,6 +523,220 @@ export function useVoice(opts: UseVoiceOptions): UseVoiceReturn {
     [support.tts, teardownTts]
   );
 
+  // ---------- Progressive TTS ----------
+
+  const teardownStreamSession = useCallback(() => {
+    const sess = streamSessionRef.current;
+    if (!sess) return;
+    sess.disposed = true;
+    for (const ac of sess.aborts) {
+      try {
+        ac.abort();
+      } catch {}
+    }
+    try {
+      sess.audio.pause();
+      sess.audio.src = "";
+      sess.audio.load();
+    } catch {}
+    try {
+      if (sess.ms.readyState === "open") sess.ms.endOfStream();
+    } catch {}
+    try {
+      URL.revokeObjectURL(sess.url);
+    } catch {}
+    streamSessionRef.current = null;
+    // Also clear the shared refs that silenceTts operates on, so
+    // barge-in from start() still works correctly.
+    if (audioElRef.current === sess.audio) audioElRef.current = null;
+    if (mediaSourceRef.current === sess.ms) mediaSourceRef.current = null;
+    if (sourceBufferRef.current === sess.sb) sourceBufferRef.current = null;
+    if (objectUrlRef.current === sess.url) objectUrlRef.current = null;
+    setIsSpeaking(false);
+  }, []);
+
+  const dispatchNext = useCallback(async (sess: StreamSession): Promise<void> => {
+    if (sess.disposed) return;
+    if (sess.inflight) return;
+
+    const text = sess.latestText;
+    const isFinal = sess.latestFinal;
+    const tail = text.slice(sess.sentIndex);
+
+    let cut: number;
+    if (isFinal) {
+      cut = tail.length;
+    } else {
+      cut = findBoundaryIndex(tail);
+      if (cut <= 0) return; // no boundary yet, wait for more text
+    }
+    if (cut <= 0) {
+      if (isFinal) {
+        try {
+          if (sess.ms.readyState === "open") sess.ms.endOfStream();
+        } catch {}
+      }
+      return;
+    }
+
+    const chunk = tail.slice(0, cut).trim();
+    sess.sentIndex += cut;
+    if (!chunk) {
+      // All whitespace — try again in case more boundaries are queued.
+      return dispatchNext(sess);
+    }
+
+    sess.inflight = true;
+    const ac = new AbortController();
+    sess.aborts.push(ac);
+
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: chunk }),
+        signal: ac.signal,
+      });
+      if (sess.disposed) return;
+      if (!res.ok || !res.body) {
+        console.warn("[useVoice] TTS upstream error", res.status);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done || sess.disposed) break;
+        if (value && value.byteLength) {
+          await appendToSourceBuffer(sess, value);
+          if (sess.disposed) break;
+          if (!sess.started) {
+            sess.started = true;
+            setIsSpeaking(true);
+            sess.audio.play().catch((err) => {
+              console.warn("[useVoice] audio.play blocked", err);
+            });
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        console.warn("[useVoice] TTS stream error", err);
+      }
+    } finally {
+      sess.inflight = false;
+    }
+
+    if (sess.disposed) return;
+
+    // If text grew while we were fetching, dispatch the next chunk.
+    if (sess.sentIndex < sess.latestText.length || sess.latestFinal) {
+      // Use latest state — caller may have updated isFinal since entry.
+      if (sess.latestFinal && sess.sentIndex >= sess.latestText.length) {
+        try {
+          if (sess.ms.readyState === "open") sess.ms.endOfStream();
+        } catch {}
+      } else {
+        await dispatchNext(sess);
+      }
+    }
+  }, []);
+
+  const speakStreaming = useCallback(
+    (messageId: string, text: string, isFinal: boolean) => {
+      if (!support.tts) return;
+      const clean = text || "";
+      if (!clean.trim() && !isFinal) return;
+
+      const current = streamSessionRef.current;
+
+      // Different message → tear down and restart. Happens when the
+      // assistant starts a new reply before the previous one finishes
+      // playing.
+      if (current && current.messageId !== messageId) {
+        teardownStreamSession();
+      }
+
+      let sess = streamSessionRef.current;
+
+      if (!sess) {
+        // Wait until we have something worth starting on. If this isn't
+        // the final call and there's no sentence boundary yet, hold off.
+        const firstBoundary = findBoundaryIndex(clean);
+        if (!isFinal && firstBoundary <= 0) return;
+        if (!isFinal && clean.trim().length < 4) return;
+
+        // Hard-cancel any old one-shot `speak()` session first so only
+        // one MediaSource is live at a time.
+        silenceTts(
+          audioElRef,
+          mediaSourceRef,
+          sourceBufferRef,
+          objectUrlRef,
+          ttsAbortRef,
+          ttsReaderRef,
+          setIsSpeaking
+        );
+
+        const audio = new Audio();
+        const ms = new MediaSource();
+        const url = URL.createObjectURL(ms);
+        audio.src = url;
+        audio.onended = () => setIsSpeaking(false);
+        audio.onerror = () => setIsSpeaking(false);
+
+        sess = {
+          messageId,
+          sentIndex: 0,
+          latestText: clean,
+          latestFinal: isFinal,
+          audio,
+          ms,
+          sb: null,
+          url,
+          aborts: [],
+          pendingAppend: Promise.resolve(),
+          inflight: false,
+          started: false,
+          disposed: false,
+        };
+        streamSessionRef.current = sess;
+        audioElRef.current = audio;
+        mediaSourceRef.current = ms;
+        objectUrlRef.current = url;
+
+        ms.addEventListener(
+          "sourceopen",
+          () => {
+            if (!sess || sess.disposed) return;
+            try {
+              sess.sb = ms.addSourceBuffer("audio/mpeg");
+              sourceBufferRef.current = sess.sb;
+            } catch (err) {
+              console.warn("[useVoice] addSourceBuffer failed", err);
+              teardownStreamSession();
+              return;
+            }
+            // Kick off the first dispatch now that the buffer is live.
+            dispatchNext(sess);
+          },
+          { once: true }
+        );
+        return;
+      }
+
+      // Session exists — just update the latest known state and kick
+      // the dispatcher. If a fetch is in flight, it'll pick up the new
+      // text when it finishes.
+      sess.latestText = clean;
+      sess.latestFinal = isFinal;
+      if (sess.sb && !sess.inflight) {
+        dispatchNext(sess);
+      }
+    },
+    [support.tts, teardownStreamSession, dispatchNext]
+  );
+
   return {
     support,
     isListening,
@@ -479,8 +745,130 @@ export function useVoice(opts: UseVoiceOptions): UseVoiceReturn {
     start,
     stop: isListening ? stop : cancelListening,
     speak,
+    speakStreaming,
     silence,
   };
+}
+
+// --- progressive TTS session ----------------------------------------
+
+type StreamSession = {
+  messageId: string;
+  /** Number of chars of latestText already dispatched to /api/tts. */
+  sentIndex: number;
+  /** Latest known message text from the caller. */
+  latestText: string;
+  /** Whether streaming has finished (so we can flush the tail). */
+  latestFinal: boolean;
+  audio: HTMLAudioElement;
+  ms: MediaSource;
+  sb: SourceBuffer | null;
+  url: string;
+  aborts: AbortController[];
+  /** Serializes `SourceBuffer.appendBuffer` calls — MSE rejects
+   *  overlapping appends. */
+  pendingAppend: Promise<void>;
+  /** Is a `/api/tts` fetch currently in flight? */
+  inflight: boolean;
+  /** Has audio.play() already been kicked off? */
+  started: boolean;
+  /** Torn down — short-circuit any late async callbacks. */
+  disposed: boolean;
+};
+
+/**
+ * Find the last "safe" place in `text` to end a TTS chunk. We prefer
+ * sentence terminators; if nothing obvious shows up after the first
+ * few chars, we settle for a clause break (`; : ,`) once the tail
+ * gets long enough that waiting longer would hurt perceived latency
+ * more than a slightly awkward cut helps prosody.
+ *
+ * Returns the char index AFTER the boundary (so `text.slice(0, idx)`
+ * is the full chunk including its punctuation + trailing whitespace),
+ * or -1 if no acceptable boundary exists yet.
+ */
+function findBoundaryIndex(text: string): number {
+  if (!text) return -1;
+
+  // Primary: sentence-end followed by whitespace or end of string.
+  // Need `\n` too because the model sometimes ends a turn on a bare
+  // newline without punctuation (e.g. after a tool-triggered card).
+  const strong = /[.!?…](\s|$)|\n/g;
+  let lastStrong = -1;
+  let m: RegExpExecArray | null;
+  while ((m = strong.exec(text)) !== null) {
+    // Include the terminator itself; skip trailing whitespace so the
+    // next chunk starts cleanly.
+    let end = m.index + m[0].length;
+    while (end < text.length && /\s/.test(text[end])) end++;
+    lastStrong = end;
+  }
+  if (lastStrong > 0) return lastStrong;
+
+  // Fallback: if we've accumulated a long clause with no sentence
+  // terminator, cut on a clause break so time-to-first-audio stays
+  // bounded. Threshold picked so typical greetings ("Hey!" = 4 chars)
+  // still wait for their real terminator.
+  if (text.length >= 80) {
+    const weak = /[;:](\s)/g;
+    let lastWeak = -1;
+    while ((m = weak.exec(text)) !== null) {
+      let end = m.index + m[0].length;
+      while (end < text.length && /\s/.test(text[end])) end++;
+      lastWeak = end;
+    }
+    if (lastWeak > 0) return lastWeak;
+  }
+
+  // Last resort: comma after 120 chars. Better to speak than to stall.
+  if (text.length >= 120) {
+    const idx = text.lastIndexOf(", ");
+    if (idx > 20) return idx + 2;
+  }
+
+  return -1;
+}
+
+/**
+ * Append an MP3 chunk to the session's SourceBuffer, serializing on
+ * the session's `pendingAppend` so multiple concurrent fetches don't
+ * race into `SourceBuffer.appendBuffer` (which throws if the buffer
+ * is still updating).
+ */
+async function appendToSourceBuffer(
+  sess: StreamSession,
+  chunk: Uint8Array
+): Promise<void> {
+  const sb = sess.sb;
+  if (!sb) return;
+  const job = sess.pendingAppend.then(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        const onDone = () => {
+          sb.removeEventListener("updateend", onDone);
+          sb.removeEventListener("error", onErr);
+          resolve();
+        };
+        const onErr = (e: Event) => {
+          sb.removeEventListener("updateend", onDone);
+          sb.removeEventListener("error", onErr);
+          reject(e);
+        };
+        sb.addEventListener("updateend", onDone);
+        sb.addEventListener("error", onErr);
+        try {
+          const copy = new Uint8Array(chunk.byteLength);
+          copy.set(chunk);
+          sb.appendBuffer(copy);
+        } catch (e) {
+          sb.removeEventListener("updateend", onDone);
+          sb.removeEventListener("error", onErr);
+          reject(e);
+        }
+      })
+  );
+  sess.pendingAppend = job.catch(() => {});
+  return job;
 }
 
 // --- helpers ---------------------------------------------------------
