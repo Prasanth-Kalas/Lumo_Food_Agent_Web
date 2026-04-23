@@ -100,7 +100,22 @@ Everything runs against `lib/mock-data.ts` — no MealMe keys needed.
 4. Deploy. Share the `*.vercel.app` URL with your 50 test friends.
 
 The `/api/chat` route streams — Vercel's Node runtime handles that out of the
-box. We've set `maxDuration: 60` in the route for long tool chains.
+box. `vercel.json` in this repo pins `maxDuration: 60` for long tool chains.
+
+### Wiring this agent to the Lumo Super Agent
+
+This project, unlike the Flight Agent, has no `@lumo/agent-sdk`
+dependency — which means it deploys to Vercel with zero extra steps,
+but also means it doesn't yet serve a manifest the shell can discover
+the "proper" way. That SDK-conformance upgrade is tracked separately.
+
+In the meantime, after you deploy this project, copy its production
+URL (e.g. `https://lumo-food-agent.vercel.app`) into the Super Agent's
+Vercel env as `LUMO_FOOD_AGENT_URL`. The shell's orchestrator uses that
+URL to proxy the user's food intent into this app's `/api/chat`.
+
+For the cross-repo picture, see
+[`../DEPLOYMENT.md`](../DEPLOYMENT.md).
 
 ### Add it to the home screen (PWA)
 
