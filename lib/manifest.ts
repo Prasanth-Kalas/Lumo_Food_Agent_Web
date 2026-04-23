@@ -32,7 +32,13 @@ export function buildManifest(): AgentManifest {
     // stable — analytics joins on them. "search_restaurants" covers both
     // the "find me tacos" and "what's near me" phrasings; "place_food_order"
     // is the money-moving intent; "cancel_food_order" is the compensation.
-    intents: ["search_restaurants", "price_food_cart", "place_food_order", "cancel_food_order"],
+    intents: [
+      "search_restaurants",
+      "get_restaurant_menu",
+      "price_food_cart",
+      "place_food_order",
+      "cancel_food_order",
+    ],
 
     example_utterances: [
       "order a pepperoni pizza and a Caesar salad from the closest place",

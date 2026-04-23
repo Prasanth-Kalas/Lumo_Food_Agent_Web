@@ -81,6 +81,42 @@ export async function GET() {
         },
       },
 
+      "/api/tools/food_get_restaurant_menu": {
+        post: {
+          operationId: "food_get_restaurant_menu",
+          summary: "Fetch a restaurant's menu",
+          description:
+            "Return the full menu for one restaurant discovered via food_search_restaurants. Items are normalized to the shape food_price_cart consumes (`item_id`, `unit_price_cents`), so the orchestrator can forward a selection straight into a cart. No PII required.",
+
+          "x-lumo-tool": true,
+          "x-lumo-cost-tier": "free",
+          "x-lumo-requires-confirmation": false,
+          "x-lumo-pii-required": [],
+          "x-lumo-intent-tags": ["get_restaurant_menu"],
+
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/FoodGetRestaurantMenuRequest" },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Restaurant menu",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/FoodGetRestaurantMenuResponse" },
+                },
+              },
+            },
+            "400": { $ref: "#/components/responses/BadRequest" },
+            "404": { $ref: "#/components/responses/RestaurantOrItemNotFound" },
+          },
+        },
+      },
+
       "/api/tools/food_price_cart": {
         post: {
           operationId: "food_price_cart",
@@ -253,6 +289,80 @@ export async function GET() {
             },
             max_eta_minutes: { type: "integer", minimum: 1, maximum: 240 },
             limit: { type: "integer", minimum: 1, maximum: 25, default: 10 },
+          },
+        },
+
+        FoodGetRestaurantMenuRequest: {
+          type: "object",
+          additionalProperties: false,
+          required: ["restaurant_id"],
+          properties: {
+            restaurant_id: {
+              type: "string",
+              minLength: 1,
+              description:
+                "id of a restaurant returned by food_search_restaurants.",
+            },
+          },
+        },
+
+        FoodMenuItemModifier: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "options"],
+          properties: {
+            name: { type: "string" },
+            options: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["label", "delta_cents"],
+                properties: {
+                  label: { type: "string" },
+                  delta_cents: { type: "integer" },
+                },
+              },
+            },
+            default: { type: "string" },
+          },
+        },
+
+        FoodMenuItem: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "item_id",
+            "name",
+            "description",
+            "unit_price_cents",
+            "category",
+          ],
+          properties: {
+            item_id: { type: "string" },
+            name: { type: "string" },
+            description: { type: "string" },
+            unit_price_cents: { type: "integer", minimum: 0 },
+            category: { type: "string" },
+            modifiers: {
+              type: "array",
+              items: { $ref: "#/components/schemas/FoodMenuItemModifier" },
+            },
+          },
+        },
+
+        FoodGetRestaurantMenuResponse: {
+          type: "object",
+          additionalProperties: false,
+          required: ["restaurant_id", "restaurant_name", "is_open", "menu"],
+          properties: {
+            restaurant_id: { type: "string" },
+            restaurant_name: { type: "string" },
+            is_open: { type: "boolean" },
+            menu: {
+              type: "array",
+              items: { $ref: "#/components/schemas/FoodMenuItem" },
+            },
           },
         },
 
