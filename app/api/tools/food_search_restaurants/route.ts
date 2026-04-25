@@ -19,6 +19,7 @@ import {
   errorResponse,
   stripEnvelopeKeys,
 } from "@/lib/agent-http";
+import { requireToolBearer } from "@/lib/tool-auth";
 
 const CuisineSchema = z.enum([
   "pizza",
@@ -50,6 +51,9 @@ const BodySchema = z
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const principal = requireToolBearer(req, ["food:read"]);
+  if (principal instanceof Response) return principal;
+
   let raw: unknown;
   try {
     raw = await req.json();

@@ -32,6 +32,7 @@ import {
   stripEnvelopeKeys,
 } from "@/lib/agent-http";
 import { cancelOrder } from "@/lib/food-store";
+import { requireToolBearer } from "@/lib/tool-auth";
 
 const BodySchema = z
   .object({
@@ -43,6 +44,9 @@ const BodySchema = z
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const principal = requireToolBearer(req, ["food:orders"]);
+  if (principal instanceof Response) return principal;
+
   // Saga stamps one key per rollback attempt. Retries of the same key
   // must converge on the same terminal state — cancelOrder enforces
   // this by returning `already_cancelled: true` on the second call.

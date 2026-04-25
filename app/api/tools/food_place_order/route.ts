@@ -38,6 +38,7 @@ import {
 } from "@/lib/agent-http";
 import { canonicalCartSummary, priceCart } from "@/lib/food-cart";
 import { placeOrder } from "@/lib/food-store";
+import { requireToolBearer } from "@/lib/tool-auth";
 import type { Cart } from "@/lib/types";
 
 const CartLineSchema = z
@@ -89,6 +90,9 @@ const BodySchema = z
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const principal = requireToolBearer(req, ["food:orders"]);
+  if (principal instanceof Response) return principal;
+
   // Orchestrator stamps one idempotency key per attempt. Same key →
   // same order_id on retry. Header-based so it rides outside the
   // domain schema (which would otherwise change the body hash).

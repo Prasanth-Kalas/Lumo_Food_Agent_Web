@@ -27,6 +27,7 @@ import {
   stripEnvelopeKeys,
 } from "@/lib/agent-http";
 import { canonicalCartSummary, priceCart } from "@/lib/food-cart";
+import { requireToolBearer } from "@/lib/tool-auth";
 
 const LineSchema = z
   .object({
@@ -47,6 +48,9 @@ const BodySchema = z
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const principal = requireToolBearer(req, ["food:read"]);
+  if (principal instanceof Response) return principal;
+
   let raw: unknown;
   try {
     raw = await req.json();

@@ -13,7 +13,7 @@
  *                                     default for prod.
  *   3. VERCEL_URL                 — auto-injected per-deploy. Used only on
  *                                     previews where 2 isn't set.
- *   4. http://localhost:3003      — local dev fallback. Flight is 3002, Food 3003.
+ *   4. http://localhost:3001      — local dev fallback. Food is 3001.
  *
  * Vercel's auto-injected URLs are bare hostnames (no protocol), so we
  * prepend https:// when returning them.
@@ -28,5 +28,5 @@ export function publicBaseUrl(): string {
   const deploy = process.env.VERCEL_URL?.trim();
   if (deploy && deploy.length > 0) return `https://${deploy.replace(/^https?:\/\//, "").replace(/\/+$/, "")}`;
 
-  return "http://localhost:3003";
+  return "http://localhost:3001";
 }

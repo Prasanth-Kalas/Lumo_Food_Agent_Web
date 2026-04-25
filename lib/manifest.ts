@@ -15,12 +15,84 @@ import { defineManifest, type AgentManifest } from "@lumo/agent-sdk";
 import { publicBaseUrl } from "./public-base-url";
 
 /**
+ * Extended manifest shape — what goes over the wire to the Super Agent.
+ *
+ * The SDK we're pinned to (pre-v0.4) doesn't know about `connect` or
+ * `listing`, so `defineManifest()` would strip them. We build the
+ * SDK-validated base via defineManifest, then merge in the appstore
+ * fields post-hoc. The Super Agent parses with SDK v0.4 which knows
+ * about them, so this works end-to-end without requiring us to bump
+ * the Food Agent's SDK pin in the same commit.
+ *
+ * When we next rev @lumo/agent-sdk in the Food Agent's package.json,
+ * move these fields inside defineManifest() where they belong.
+ */
+export interface ExtendedAgentManifest extends AgentManifest {
+  connect: {
+    model: "oauth2";
+    authorize_url: string;
+    token_url: string;
+    revocation_url?: string;
+    scopes: Array<{ name: string; description: string; required: boolean }>;
+    client_id_env: string;
+    client_secret_env?: string;
+    client_type: "public" | "confidential";
+  };
+  listing?: {
+    logo_url?: string;
+    hero_url?: string;
+    category?: string;
+    about_paragraphs?: string[];
+    homepage_url?: string;
+    privacy_policy_url?: string;
+    terms_url?: string;
+    pricing_note?: string;
+  };
+}
+
+/**
  * Build the manifest at request time so `PUBLIC_BASE_URL` can be changed
  * without rebuilding (Vercel preview URLs, staging overlays, etc.).
  */
-export function buildManifest(): AgentManifest {
+export function buildManifest(): ExtendedAgentManifest {
   const base = publicBaseUrl();
+  const sdkValidated = buildSdkValidated(base);
 
+  return {
+    ...sdkValidated,
+    connect: {
+      model: "oauth2",
+      authorize_url: `${base}/oauth/authorize`,
+      token_url: `${base}/api/oauth/token`,
+      scopes: [
+        {
+          name: "food:read",
+          description: "Browse restaurants and menus",
+          required: true,
+        },
+        {
+          name: "food:orders",
+          description: "Place, track, and cancel food orders on your behalf",
+          required: true,
+        },
+      ],
+      client_id_env: "LUMO_FOOD_OAUTH_CLIENT_ID",
+      client_secret_env: "LUMO_FOOD_OAUTH_CLIENT_SECRET",
+      client_type: "confidential",
+    },
+    listing: {
+      category: "Food & Delivery",
+      pricing_note: "Free · per-order fees apply",
+      about_paragraphs: [
+        "Lumo Food searches restaurants near you, prices a cart with delivery + tax, and places orders with secure payment.",
+        "Connect once, then say things like 'order dinner' or 'reorder my usual' — Lumo handles the rest.",
+      ],
+      homepage_url: `${base}`,
+    },
+  };
+}
+
+function buildSdkValidated(base: string): AgentManifest {
   return defineManifest({
     agent_id: "food",
     version: "0.1.0",
