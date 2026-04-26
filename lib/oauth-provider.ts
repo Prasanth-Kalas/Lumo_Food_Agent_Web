@@ -2,9 +2,11 @@
  * Minimal OAuth 2.1 Authorization Server for the Food Agent.
  *
  * Scope: MVP — single relying-party (the Lumo Super Agent). Authorization
- * Code + PKCE. Confidential client (client_id + client_secret). Tokens
- * live in-memory per Node process — fine for dev and a single-instance
- * Vercel deploy; wire to Postgres once we run horizontally.
+ * Code + PKCE. Confidential client (client_id + client_secret). In
+ * production/serverless, grants and tokens are signed self-contained
+ * envelopes so the authorization and token endpoints can run on different
+ * Vercel instances. In local dev without a signing secret, we keep the
+ * original process-local maps for convenience.
  *
  * This file implements:
  *
@@ -31,7 +33,7 @@
  * on each use (mitigates leaked-refresh-token replay).
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 // ──────────────────────────────────────────────────────────────────────────
 // In-memory stores. Process-local. Survive only until restart.
@@ -68,6 +70,7 @@ const refreshTokens = new Map<string, RefreshToken>();
 
 const GRANT_TTL_MS = 60 * 1000;
 const ACCESS_TTL_SEC = 60 * 60;
+const REFRESH_TTL_SEC = 60 * 60 * 24 * 30;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Client credential check
@@ -104,6 +107,20 @@ export function mintAuthorizeGrant(args: {
   if (args.code_challenge_method !== "S256") {
     throw new Error("Only S256 PKCE is supported.");
   }
+  if (hasSigningSecret()) {
+    return {
+      code: signEnvelope("fc", {
+        typ: "grant",
+        client_id: args.client_id,
+        redirect_uri: args.redirect_uri,
+        scope: args.scope,
+        code_challenge: args.code_challenge,
+        code_challenge_method: "S256",
+        user_id: args.user_id,
+        exp: nowSeconds() + Math.floor(GRANT_TTL_MS / 1000),
+      }),
+    };
+  }
   const code = urlSafeRandom(32);
   grants.set(code, {
     code,
@@ -136,10 +153,22 @@ export function exchangeCodeForTokens(args: {
   redirect_uri: string;
   client_id: string;
 }): TokenResponse {
-  const grant = grants.get(args.code);
+  const signedGrant = verifyEnvelope<SignedGrantPayload>(args.code, "fc", "grant");
+  const grant = signedGrant
+    ? {
+        code: args.code,
+        client_id: signedGrant.client_id,
+        redirect_uri: signedGrant.redirect_uri,
+        scope: signedGrant.scope,
+        code_challenge: signedGrant.code_challenge,
+        code_challenge_method: signedGrant.code_challenge_method,
+        user_id: signedGrant.user_id,
+        expires_at: signedGrant.exp * 1000,
+      }
+    : grants.get(args.code);
   if (!grant) throw new OAuthError("invalid_grant", "Unknown or expired code.");
   // Single-use.
-  grants.delete(args.code);
+  if (!signedGrant) grants.delete(args.code);
   if (grant.expires_at < Date.now()) {
     throw new OAuthError("invalid_grant", "Authorization code expired.");
   }
@@ -166,6 +195,22 @@ export function refreshAccessToken(args: {
   refresh_token: string;
   client_id: string;
 }): TokenResponse {
+  const signedRefresh = verifyEnvelope<SignedRefreshPayload>(
+    args.refresh_token,
+    "fr",
+    "refresh",
+  );
+  if (signedRefresh) {
+    if (signedRefresh.client_id !== args.client_id) {
+      throw new OAuthError("invalid_grant", "Refresh token does not belong to this client.");
+    }
+    return issueTokens({
+      user_id: signedRefresh.user_id,
+      scopes: signedRefresh.scopes,
+      client_id: signedRefresh.client_id,
+    });
+  }
+
   const rt = refreshTokens.get(args.refresh_token);
   if (!rt) throw new OAuthError("invalid_grant", "Unknown refresh token.");
   if (rt.client_id !== args.client_id) {
@@ -181,6 +226,28 @@ function issueTokens(args: {
   scopes: string[];
   client_id: string;
 }): TokenResponse {
+  if (hasSigningSecret()) {
+    const now = nowSeconds();
+    return {
+      access_token: signEnvelope("fa", {
+        typ: "access",
+        user_id: args.user_id,
+        scopes: args.scopes,
+        exp: now + ACCESS_TTL_SEC,
+      }),
+      token_type: "Bearer",
+      expires_in: ACCESS_TTL_SEC,
+      refresh_token: signEnvelope("fr", {
+        typ: "refresh",
+        user_id: args.user_id,
+        scopes: args.scopes,
+        client_id: args.client_id,
+        exp: now + REFRESH_TTL_SEC,
+      }),
+      scope: args.scopes.join(" "),
+    };
+  }
+
   const access_token = `fa_${urlSafeRandom(32)}`;
   const refresh_token = `fr_${urlSafeRandom(32)}`;
   const expires_at = Math.floor(Date.now() / 1000) + ACCESS_TTL_SEC;
@@ -214,6 +281,11 @@ function issueTokens(args: {
 export function resolveBearer(
   token: string,
 ): { user_id: string; scopes: string[] } | null {
+  const signedAccess = verifyEnvelope<SignedAccessPayload>(token, "fa", "access");
+  if (signedAccess) {
+    return { user_id: signedAccess.user_id, scopes: signedAccess.scopes };
+  }
+
   const row = accessTokens.get(token);
   if (!row) return null;
   if (row.expires_at * 1000 < Date.now()) {
@@ -241,12 +313,108 @@ export class OAuthError extends Error {
   }
 }
 
+interface SignedGrantPayload extends SignedPayload {
+  typ: "grant";
+  client_id: string;
+  redirect_uri: string;
+  scope: string;
+  code_challenge: string;
+  code_challenge_method: "S256";
+  user_id: string;
+}
+
+interface SignedAccessPayload extends SignedPayload {
+  typ: "access";
+  user_id: string;
+  scopes: string[];
+}
+
+interface SignedRefreshPayload extends SignedPayload {
+  typ: "refresh";
+  user_id: string;
+  scopes: string[];
+  client_id: string;
+}
+
+interface SignedPayload {
+  typ: string;
+  exp: number;
+}
+
+function hasSigningSecret(): boolean {
+  return signingSecret().length >= 32;
+}
+
+function signingSecret(): string {
+  return (
+    process.env.LUMO_FOOD_OAUTH_SIGNING_SECRET ??
+    process.env.LUMO_SUPER_AGENT_CLIENT_SECRET ??
+    ""
+  ).trim();
+}
+
+function signEnvelope(prefix: "fc" | "fa" | "fr", payload: Record<string, unknown>): string {
+  const body = base64urlEncode(JSON.stringify(payload));
+  const sig = hmac(body);
+  return `${prefix}_${body}.${sig}`;
+}
+
+function verifyEnvelope<T extends SignedPayload>(
+  token: string,
+  prefix: "fc" | "fa" | "fr",
+  typ: T["typ"],
+): T | null {
+  if (!hasSigningSecret()) return null;
+  const start = `${prefix}_`;
+  if (!token.startsWith(start)) return null;
+  const rest = token.slice(start.length);
+  const dot = rest.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const body = rest.slice(0, dot);
+  const sig = rest.slice(dot + 1);
+  if (!safeEqual(sig, hmac(body))) return null;
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(base64urlDecode(body));
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  const row = payload as Partial<T>;
+  if (row.typ !== typ) return null;
+  if (typeof row.exp !== "number" || row.exp < nowSeconds()) return null;
+  return row as T;
+}
+
+function hmac(body: string): string {
+  return createHmac("sha256", signingSecret()).update(body).digest("base64url");
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
 function urlSafeRandom(bytes: number): string {
   return randomBytes(bytes)
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+function base64urlEncode(input: string): string {
+  return Buffer.from(input, "utf8").toString("base64url");
+}
+
+function base64urlDecode(input: string): string {
+  return Buffer.from(input, "base64url").toString("utf8");
 }
 
 function base64urlSha256(input: string): string {
